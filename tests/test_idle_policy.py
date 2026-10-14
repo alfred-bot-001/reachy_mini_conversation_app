@@ -1,9 +1,12 @@
 from __future__ import annotations
 from typing import Any
+from dataclasses import replace
 
 import reachy_mini_conversation_app.idle_policy as idle_policy_mod
+from reachy_mini_conversation_app.tools.dance import Dance
 from reachy_mini_conversation_app.tools.move_head import MoveHead
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
+from reachy_mini_conversation_app.tools.play_emotion import PlayEmotion
 from reachy_mini_conversation_app.tools.idle_do_nothing import IdleDoNothing
 
 
@@ -45,6 +48,14 @@ def test_choose_idle_tool_call_rejects_same_name_with_unmatched_class() -> None:
 
 def test_choose_idle_tool_call_keeps_args_with_weighted_candidate(monkeypatch) -> None:
     """Argument generation should stay attached to the weighted candidate."""
+    monkeypatch.setattr(
+        idle_policy_mod,
+        "_IDLE_TOOL_CANDIDATES",
+        tuple(
+            replace(candidate, weight=1.0) if candidate.tool_type is MoveHead else candidate
+            for candidate in idle_policy_mod._IDLE_TOOL_CANDIDATES
+        ),
+    )
     monkeypatch.setattr(idle_policy_mod.random, "choice", lambda _choices: "right")
 
     selected = idle_policy_mod.choose_idle_tool_call(
@@ -53,3 +64,27 @@ def test_choose_idle_tool_call_keeps_args_with_weighted_candidate(monkeypatch) -
     )
 
     assert selected == ("move_head", {"direction": "right"})
+
+
+def test_default_idle_policy_only_selects_stillness() -> None:
+    """Without interaction the default policy keeps the robot still even when motion tools are available."""
+    registry: dict[str, Tool] = {
+        "idle_do_nothing": IdleDoNothing(),
+        "dance": Dance(),
+        "play_emotion": PlayEmotion(),
+        "move_head": MoveHead(),
+    }
+
+    for _ in range(50):
+        selected = idle_policy_mod.choose_idle_tool_call(registry.keys(), tool_registry=registry)
+        assert selected == ("idle_do_nothing", {"reason": "random idle policy selected stillness"})
+
+
+def test_choose_idle_tool_call_skips_zero_weight_candidates() -> None:
+    """Zero-weight idle tools are never selected, and selecting among none of them does not raise."""
+    selected = idle_policy_mod.choose_idle_tool_call(
+        ["dance", "play_emotion", "move_head"],
+        tool_registry={"dance": Dance(), "play_emotion": PlayEmotion(), "move_head": MoveHead()},
+    )
+
+    assert selected is None
