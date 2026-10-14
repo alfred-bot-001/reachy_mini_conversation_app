@@ -76,11 +76,12 @@ class BreathingMove(Move):  # type: ignore
         self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
         self.neutral_antennas = np.array([-0.1745, 0.1745])  # ~10° offset to reduce shaking
 
-        # Breathing parameters
-        self.breathing_z_amplitude = 0.005  # 5mm gentle breathing
+        # Breathing parameters: kept minimal so the robot stays calm when nobody interacts with it.
+        self.breathing_z_amplitude = 0.002  # 2mm, barely visible head breathing
         self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
-        self.antenna_sway_amplitude = np.deg2rad(15)  # 15 degrees
-        self.antenna_frequency = 0.5  # Hz (faster antenna sway)
+        # Must stay below the 10° neutral offset so the antennas never cross vertical.
+        self.antenna_sway_amplitude = np.deg2rad(3)  # 3 degrees around the neutral offset
+        self.antenna_frequency = 0.2  # Hz (one slow sway every 5 seconds)
 
     @property
     def duration(self) -> float:
@@ -114,9 +115,10 @@ class BreathingMove(Move):  # type: ignore
             z_offset = self.breathing_z_amplitude * np.sin(2 * np.pi * self.breathing_frequency * breathing_time)
             head_pose = create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=0, yaw=0, degrees=True, mm=False)
 
-            # Antenna sway (opposite directions)
+            # Antenna sway (opposite directions) around the neutral offset, so phase 2 starts exactly
+            # where phase 1 ended instead of jumping back to vertical.
             antenna_sway = self.antenna_sway_amplitude * np.sin(2 * np.pi * self.antenna_frequency * breathing_time)
-            antennas = np.array([antenna_sway, -antenna_sway], dtype=np.float64)
+            antennas = (self.neutral_antennas + np.array([antenna_sway, -antenna_sway])).astype(np.float64)
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
         return (head_pose, antennas, 0.0)

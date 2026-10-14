@@ -1,13 +1,17 @@
 """Local idle tool selection and dispatch.
 
 Default idle weights among active, registered tools:
-- IdleDoNothing: 60%
-- Dance: 16%
-- PlayEmotion: 16%
-- MoveHead: 8%
+- IdleDoNothing: 100%
+- Dance: 0%
+- PlayEmotion: 0%
+- MoveHead: 0%
+
+Without interaction the robot should stay as still as possible, so only stillness is selected by default; the other
+candidates are kept so a non-zero weight re-enables them. Dance, emotions and head moves remain available to the model
+during a conversation.
 
 Profiles or sessions can disable tools. When one or more idle tools are unavailable, selection is renormalized across the
-remaining active candidates.
+remaining active candidates. Candidates with a zero weight are never selected.
 """
 
 from __future__ import annotations
@@ -58,10 +62,10 @@ def _move_head_args() -> dict[str, Any]:
 
 
 _IDLE_TOOL_CANDIDATES: Final[tuple[IdleToolCandidate, ...]] = (
-    IdleToolCandidate(IdleDoNothing, 0.60, _idle_do_nothing_args),
-    IdleToolCandidate(Dance, 0.16, _no_args),
-    IdleToolCandidate(PlayEmotion, 0.16, _no_args),
-    IdleToolCandidate(MoveHead, 0.08, _move_head_args),
+    IdleToolCandidate(IdleDoNothing, 1.0, _idle_do_nothing_args),
+    IdleToolCandidate(Dance, 0.0, _no_args),
+    IdleToolCandidate(PlayEmotion, 0.0, _no_args),
+    IdleToolCandidate(MoveHead, 0.0, _move_head_args),
 )
 
 
@@ -76,6 +80,7 @@ def choose_idle_tool_call(
     candidates = [
         (tool.name, candidate)
         for candidate in _IDLE_TOOL_CANDIDATES
+        if candidate.weight > 0
         for tool in registry.values()
         if tool.name in available and isinstance(tool, candidate.tool_type)
     ]
