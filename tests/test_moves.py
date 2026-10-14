@@ -157,6 +157,38 @@ def test_breathing_move_interpolates_then_breathes() -> None:
     assert body_yaw_breathe == 0.0
 
 
+def test_breathing_antennas_do_not_jump_when_breathing_starts() -> None:
+    """Phase 2 continues from the neutral antennas reached at the end of phase 1."""
+    move = BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+        interpolation_start_antennas=(0.3, -0.3),
+        interpolation_duration=1.0,
+    )
+    _, antennas_end_of_interpolation, _ = move.evaluate(1.0 - 1e-6)
+    _, antennas_start_of_breathing, _ = move.evaluate(1.0)
+    assert antennas_end_of_interpolation is not None and antennas_start_of_breathing is not None
+
+    np.testing.assert_allclose(antennas_start_of_breathing, antennas_end_of_interpolation, atol=1e-4)
+
+
+def test_breathing_stays_small_and_antennas_never_cross_vertical() -> None:
+    """Idle breathing keeps antennas within a few degrees of neutral and the head nearly still."""
+    neutral = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+    move = BreathingMove(
+        interpolation_start_pose=neutral,
+        interpolation_start_antennas=(-0.1745, 0.1745),
+        interpolation_duration=1.0,
+    )
+
+    for t in np.linspace(1.0, 31.0, 601):
+        head, antennas, _ = move.evaluate(float(t))
+        assert head is not None and antennas is not None
+        right, left = antennas
+        assert right < 0.0 < left
+        np.testing.assert_array_less(np.abs(antennas - np.array([-0.1745, 0.1745])), np.deg2rad(5))
+        assert abs(head[2, 3]) <= 0.003
+
+
 def test_is_idle_reflects_listening_and_activity() -> None:
     """is_idle is False while listening and True once past the inactivity delay."""
     manager = MovementManager(MagicMock())
