@@ -2,13 +2,15 @@
 
 Default idle weights among active, registered tools:
 - IdleDoNothing: 100%
-- Dance: 0%
 - PlayEmotion: 0%
 - MoveHead: 0%
 
 Without interaction the robot should stay as still as possible, so only stillness is selected by default; the other
 candidates are kept so a non-zero weight re-enables them. Dance, emotions and head moves remain available to the model
 during a conversation.
+
+The robot never dances without interaction: Dance is not an idle candidate, any tool that is a Dance is rejected even
+if a candidate type would match it, and a re-enabled idle emotion only picks calm intents, never dance emotions.
 
 Profiles or sessions can disable tools. When one or more idle tools are unavailable, selection is renormalized across the
 remaining active candidates. Candidates with a zero weight are never selected.
@@ -49,12 +51,19 @@ class IdleToolCandidate:
     args_factory: Callable[[], dict[str, Any]]
 
 
-def _no_args() -> dict[str, Any]:
-    return {}
-
-
 def _idle_do_nothing_args() -> dict[str, Any]:
     return {"reason": "random idle policy selected stillness"}
+
+
+# Calm intents only: "excited" and "dance" resolve to dance emotions and must never play without interaction.
+_IDLE_EMOTION_INTENTS: Final[tuple[str, ...]] = ("calming", "attentive", "thinking")
+
+# Tool types that must never run as an idle action, whatever the candidate weights say.
+_FORBIDDEN_IDLE_TOOL_TYPES: Final[tuple[type[core_tools.Tool], ...]] = (Dance,)
+
+
+def _play_emotion_args() -> dict[str, Any]:
+    return {"emotion": random.choice(_IDLE_EMOTION_INTENTS)}
 
 
 def _move_head_args() -> dict[str, Any]:
@@ -63,8 +72,7 @@ def _move_head_args() -> dict[str, Any]:
 
 _IDLE_TOOL_CANDIDATES: Final[tuple[IdleToolCandidate, ...]] = (
     IdleToolCandidate(IdleDoNothing, 1.0, _idle_do_nothing_args),
-    IdleToolCandidate(Dance, 0.0, _no_args),
-    IdleToolCandidate(PlayEmotion, 0.0, _no_args),
+    IdleToolCandidate(PlayEmotion, 0.0, _play_emotion_args),
     IdleToolCandidate(MoveHead, 0.0, _move_head_args),
 )
 
@@ -82,7 +90,9 @@ def choose_idle_tool_call(
         for candidate in _IDLE_TOOL_CANDIDATES
         if candidate.weight > 0
         for tool in registry.values()
-        if tool.name in available and isinstance(tool, candidate.tool_type)
+        if tool.name in available
+        and isinstance(tool, candidate.tool_type)
+        and not isinstance(tool, _FORBIDDEN_IDLE_TOOL_TYPES)
     ]
     if not candidates:
         return None
