@@ -26,14 +26,17 @@ from openai.types.realtime import (
 from websockets.exceptions import ConnectionClosedError
 from openai.types.realtime.realtime_audio_input_turn_detection_param import ServerVad
 
+from reachy_mini_conversation_app.doze import DozeState
 from reachy_mini_conversation_app.tools import core_tools
 from reachy_mini_conversation_app.config import (
     HF_LOCAL_CONNECTION_MODE,
     config,
     get_default_voice,
+    resolve_wake_words,
     set_custom_profile,
     get_available_voices,
     get_hf_direct_ws_url,
+    resolve_doze_minutes,
     parse_hf_realtime_url,
     get_hf_connection_selection,
 )
@@ -163,6 +166,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+        doze_minutes = resolve_doze_minutes()
+        self._doze = DozeState(doze_minutes * 60.0 if doze_minutes else None, resolve_wake_words())
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -233,7 +238,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         model="gpt-4o-transcribe",
                         language=config.REALTIME_TRANSCRIPTION_LANGUAGE,
                     ),
-                    turn_detection=ServerVad(type="server_vad", interrupt_response=True),
+                    turn_detection=self._turn_detection(),
                 ),
                 output=RealtimeAudioConfigOutputParam(
                     format=_native_rate_audio_pcm(),  # type: ignore[typeddict-item]
@@ -244,13 +249,68 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             tool_choice="auto",
         )
 
+    def _turn_detection(self) -> ServerVad:
+        """Server VAD config; while dozing, speech is transcribed but not answered."""
+        return ServerVad(type="server_vad", interrupt_response=True, create_response=not self._doze.dozing)
+
     def _is_connected(self) -> bool:
         """Return whether the realtime connection is open."""
         return self.connection is not None
 
     def _idle_behavior_ready(self) -> bool:
-        """Hold idle behavior while a model response is still active."""
-        return self._response_done_event.is_set()
+        """Hold idle behavior while a model response is still active or Reachy is dozing."""
+        return self._response_done_event.is_set() and not self._doze.dozing
+
+    @property
+    def is_dozing(self) -> bool:
+        """Return whether Reachy is dozing and waiting for its name."""
+        return self._doze.dozing
+
+    async def _send_turn_detection(self) -> None:
+        """Push the current auto-response setting to the backend (session.update deep-merges)."""
+        if not self.connection:
+            return
+        try:
+            await self.connection.session.update(
+                session={"type": "realtime", "audio": {"input": {"turn_detection": self._turn_detection()}}},
+            )
+        except Exception as e:
+            logger.warning("Failed to update turn detection for doze: %s", e)
+
+    async def _maybe_doze(self) -> None:
+        """Doze after a long silence once nothing is pending."""
+        if (
+            self._doze.should_doze(time.monotonic() - self.last_activity_time)
+            and self._is_connected()
+            and self._response_done_event.is_set()
+            and self._pending_responses.empty()
+            and not self._in_flight_tool_calls
+        ):
+            await self.fall_asleep()
+
+    async def fall_asleep(self) -> None:
+        """Tuck the head, hold still, and stop answering until called by name."""
+        if not self._doze.doze():
+            return
+        logger.info(
+            "No conversation for %.0f minutes; dozing until called by name", (self._doze.doze_after_s or 0) / 60
+        )
+        self.deps.movement_manager.set_dozing(True)
+        await self._send_turn_detection()
+
+    async def wake_up(self, reason: str) -> None:
+        """Leave doze: raise the head and answer again."""
+        if not self._doze.wake():
+            return
+        logger.info("Waking up from doze (%s)", reason)
+        self.deps.movement_manager.set_dozing(False)
+        await self._send_turn_detection()
+        self._mark_activity(f"wake_{reason}")
+
+    async def emit(self) -> Any:
+        """Check for doze before emitting the next output."""
+        await self._maybe_doze()
+        return await super().emit()
 
     async def _cancel_partial_transcript_task(self) -> None:
         if self.partial_transcript_task and not self.partial_transcript_task.done():
@@ -457,6 +517,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise ValueError("say: empty text")
         if not self.connection:
             raise RuntimeError("say: no active session")
+        await self.wake_up("say")
         await self.connection.conversation.item.create(
             item={
                 "type": "message",
@@ -834,6 +895,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
                             continue
+
+                        if self._doze.dozing:
+                            if not self._doze.is_wake_call(transcript):
+                                logger.info("Dozing; ignored speech without the wake word: %r", transcript)
+                                dropped_item_id = getattr(event, "item_id", None)
+                                if dropped_item_id:
+                                    try:
+                                        await self.connection.conversation.item.delete(item_id=dropped_item_id)
+                                    except Exception as e:
+                                        logger.debug("Could not drop dozing transcript item: %s", e)
+                                continue
+                            await self.wake_up("wake_word")
+                            # Auto-response was off when this turn was committed; answer it explicitly.
+                            await self._safe_response_create()
 
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None

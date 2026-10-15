@@ -7,6 +7,8 @@ Design overview
 - The control loop runs near 100 Hz and is phase-aligned via a monotonic clock.
 - Idle behaviour starts an infinite `BreathingMove` after a short inactivity delay
   unless listening is active.
+- Dozing replaces everything with an infinite `DozeMove` (head tucked, antennas
+  folded) and rejects new moves until woken.
 
 Threading model
 - A dedicated worker thread owns all real-time state and issues `set_target`
@@ -38,6 +40,7 @@ from numpy.typing import NDArray
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
 from reachy_mini.motion.move import Move
+from reachy_mini.reachy_mini import SLEEP_HEAD_POSE, SLEEP_ANTENNAS_JOINT_POSITIONS
 from reachy_mini.utils.interpolation import compose_world_offset, linear_pose_interpolation
 from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
 
@@ -122,6 +125,38 @@ class BreathingMove(Move):  # type: ignore
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
         return (head_pose, antennas, 0.0)
+
+
+class DozeMove(Move):  # type: ignore
+    """Tuck the head and fold the antennas into the sleep pose, then hold perfectly still."""
+
+    def __init__(
+        self,
+        start_pose: NDArray[np.float32],
+        start_antennas: Tuple[float, float],
+        transition_duration: float = 3.0,
+    ):
+        """Initialize the doze move from the currently commanded pose."""
+        self.start_pose = start_pose
+        self.start_antennas = np.array(start_antennas, dtype=np.float64)
+        self.transition_duration = transition_duration
+        self.sleep_pose = np.array(SLEEP_HEAD_POSE, dtype=np.float64)
+        self.sleep_antennas = np.array(SLEEP_ANTENNAS_JOINT_POSITIONS, dtype=np.float64)
+
+    @property
+    def duration(self) -> float:
+        """Never ends on its own; waking replaces it."""
+        return float("inf")
+
+    def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+        """Ease into the sleep pose, then hold it."""
+        if t >= self.transition_duration:
+            return (self.sleep_pose.copy(), self.sleep_antennas.copy(), 0.0)
+        # Cosine easing: starts and ends slowly, like settling down to sleep.
+        s = 0.5 - 0.5 * np.cos(np.pi * max(0.0, t) / self.transition_duration)
+        head_pose = linear_pose_interpolation(self.start_pose, self.sleep_pose, s)
+        antennas = (1 - s) * self.start_antennas + s * self.sleep_antennas
+        return (head_pose, antennas.astype(np.float64), 0.0)
 
 
 def clone_full_body_pose(pose: FullBodyPose) -> FullBodyPose:
@@ -223,6 +258,7 @@ class MovementManager:
         self._antenna_blend_duration = 0.4  # seconds to blend back after listening
         self._last_listening_blend_time = self._now()
         self._breathing_active = False  # true when breathing move is running or queued
+        self._dozing = False  # true while holding the doze pose; new moves are rejected
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
         self._last_set_target_err = 0.0
@@ -292,6 +328,13 @@ class MovementManager:
         """Start or stop following the user's face; thread-safe via the command queue."""
         self._command_queue.put(("set_head_tracking", enabled))
 
+    def set_dozing(self, dozing: bool) -> None:
+        """Tuck into the doze pose and hold still, or wake back up to breathing.
+
+        Thread-safe: posted to the worker command queue.
+        """
+        self._command_queue.put(("set_dozing", dozing))
+
     def set_speaking(self, speaking: bool) -> None:
         """Pause head tracking while the assistant speaks, resume it afterwards.
 
@@ -313,6 +356,9 @@ class MovementManager:
     def _handle_command(self, command: str, payload: Any, current_time: float) -> None:
         """Handle a single cross-thread command."""
         if command == "queue_move":
+            if self._dozing:
+                logger.debug("Dozing; ignored queued move %s", type(payload).__name__)
+                return
             if isinstance(payload, Move):
                 self.move_queue.append(payload)
                 self.state.update_activity()
@@ -333,6 +379,8 @@ class MovementManager:
                 logger.warning("Ignored queue_move command with invalid payload: %s", payload)
         elif command == "clear_queue":
             self.move_queue.clear()
+            if self._dozing:
+                return  # keep holding the doze pose
             self.state.current_move = None
             self.state.move_start_time = None
             self._breathing_active = False
@@ -377,6 +425,8 @@ class MovementManager:
             self._track_anchor = None
             # set_speaking is gated off while disabled, so its state would go stale across a toggle.
             self._is_speaking = False
+            if self._dozing:
+                return  # applied on wake
             try:
                 if enabled:
                     self.current_robot.start_head_tracking(weight=1.0)
@@ -384,8 +434,10 @@ class MovementManager:
                     self.current_robot.stop_head_tracking()
             except Exception as e:
                 logger.warning("Head-tracking toggle failed: %s", e)
+        elif command == "set_dozing":
+            self._set_dozing(bool(payload), current_time)
         elif command == "set_speaking":
-            if not self._head_tracking:
+            if not self._head_tracking or self._dozing:
                 return
             speaking = bool(payload)
             if self._is_speaking == speaking:
@@ -403,6 +455,39 @@ class MovementManager:
                 logger.warning("Head-tracking speaking handoff failed: %s", e)
         else:
             logger.warning("Unknown command received by MovementManager: %s", command)
+
+    def _set_dozing(self, dozing: bool, current_time: float) -> None:
+        """Enter or leave the doze pose (worker thread only)."""
+        if self._dozing == dozing:
+            return
+        head, antennas, _ = clone_full_body_pose(self._last_commanded_pose)
+        self._dozing = dozing
+        self.move_queue.clear()
+        self._track_anchor = None
+        self._is_speaking = False
+        if dozing:
+            self.state.current_move = DozeMove(start_pose=head, start_antennas=antennas)
+            self._breathing_active = False
+            logger.info("Dozing: tucking the head and holding still")
+        else:
+            # Breathing starts with a slow interpolation back to neutral, so waking up rises gently.
+            self.state.current_move = BreathingMove(
+                interpolation_start_pose=head,
+                interpolation_start_antennas=antennas,
+                interpolation_duration=2.0,
+            )
+            self._breathing_active = True
+            self.state.update_activity()
+            logger.info("Waking up from doze")
+        self.state.move_start_time = current_time
+        if self._head_tracking:
+            try:
+                if dozing:
+                    self.current_robot.stop_head_tracking()
+                else:
+                    self.current_robot.start_head_tracking(weight=1.0)
+            except Exception as e:
+                logger.warning("Head-tracking doze toggle failed: %s", e)
 
     def _publish_shared_state(self) -> None:
         """Expose idle-related state for external threads."""
@@ -707,6 +792,7 @@ class MovementManager:
             "queue_size": len(self.move_queue),
             "is_listening": self._is_listening,
             "breathing_active": self._breathing_active,
+            "dozing": self._dozing,
             "last_commanded_pose": {
                 "head": head_matrix,
                 "antennas": antennas,
