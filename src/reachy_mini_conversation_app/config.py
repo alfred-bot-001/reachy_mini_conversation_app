@@ -124,6 +124,39 @@ def _env_flag(name: str, default: bool = False) -> bool:
 APP_TIMEOUT_MINUTES_ENV = "REACHY_MINI_APP_TIMEOUT_MINUTES"
 DEFAULT_APP_TIMEOUT_MINUTES = 1440.0
 
+DOZE_MINUTES_ENV = "REACHY_MINI_DOZE_MINUTES"
+DEFAULT_DOZE_MINUTES = 30.0
+WAKE_WORDS_ENV = "REACHY_MINI_WAKE_WORDS"
+# The robot's name plus common speech-recognition homophones of it.
+DEFAULT_WAKE_WORDS = ("小白", "小百", "晓白", "小柏", "筱白", "小拜", "小摆", "小败", "xiaobai")
+
+
+def speech_wobble_enabled() -> bool:
+    """Return whether the head should wobble with the assistant's voice (off by default)."""
+    return _env_flag("REACHY_MINI_SPEECH_WOBBLE", default=False)
+
+
+def resolve_doze_minutes() -> float | None:
+    """Read how long without conversation before dozing (minutes); None means never doze."""
+    raw_value = os.getenv(DOZE_MINUTES_ENV, "").strip()
+    if not raw_value:
+        return DEFAULT_DOZE_MINUTES
+    try:
+        minutes = float(raw_value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using default.", DOZE_MINUTES_ENV, raw_value)
+        return DEFAULT_DOZE_MINUTES
+    return minutes if minutes > 0 else None
+
+
+def resolve_wake_words() -> tuple[str, ...]:
+    """Read the comma-separated wake words that end a doze."""
+    raw_value = os.getenv(WAKE_WORDS_ENV, "").strip()
+    if not raw_value:
+        return DEFAULT_WAKE_WORDS
+    words = tuple(word.strip() for word in raw_value.replace("，", ",").split(",") if word.strip())
+    return words or DEFAULT_WAKE_WORDS
+
 
 def resolve_app_timeout_minutes() -> float | None:
     """Read the app inactivity timeout (minutes) from the environment; None means disabled."""

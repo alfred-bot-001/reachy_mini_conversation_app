@@ -89,6 +89,8 @@ def run(
     from reachy_mini_conversation_app.config import (
         HF_LOCAL_CONNECTION_MODE,
         set_instance_path,
+        resolve_doze_minutes,
+        speech_wobble_enabled,
         get_hf_connection_selection,
         resolve_app_timeout_minutes,
         refresh_runtime_config_from_env,
@@ -288,10 +290,20 @@ def run(
     # Audio-reactive head motion is driven by the daemon's wobbler, which
     # taps the media pipeline at push_audio_sample. The console stream pushes
     # assistant audio through that pipeline directly.
-    robot.enable_wobbling()
+    # Off by default so Reachy holds its head still while talking (REACHY_MINI_SPEECH_WOBBLE=1 restores it).
+    if speech_wobble_enabled():
+        robot.enable_wobbling()
+    else:
+        try:
+            robot.disable_wobbling()
+        except Exception as e:
+            logger.debug("Error disabling speech wobble: %s", e)
 
+    # Dozing keeps the app listening for its name, so the inactivity stop (which ends the app) is skipped.
     timeout_minutes = resolve_app_timeout_minutes()
-    if timeout_minutes is not None:
+    if resolve_doze_minutes() is not None:
+        logger.info("Doze enabled; app inactivity timeout disabled.")
+    elif timeout_minutes is not None:
         _start_inactivity_timeout_thread(timeout_minutes, stream_manager, logger, app_stop_event, run_go_to_sleep_tool)
 
     def poll_stop_event() -> None:
