@@ -73,9 +73,9 @@ def test_doze_settings_default_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_wake_call_matches_name_and_homophones_only() -> None:
     """The name (or a common mis-transcription of it) wakes Reachy; other speech does not."""
     doze = DozeState(1800, DEFAULT_WAKE_WORDS)
-    for text in ("小白", "小白，起床啦", "嘿 小 白！", "晓白你醒醒", "Xiao Bai wake up"):
+    for text in ("风风", "风风，起床啦", "嘿 风 风！", "峰峰你醒醒", "丰风快醒醒", "Feng Feng wake up"):
         assert doze.is_wake_call(text), text
-    for text in ("今天吃什么", "白菜多少钱", "小明快来", "", "   "):
+    for text in ("今天吃什么", "外面风好大", "小白快来", "丰富多彩", "", "   "):
         assert not doze.is_wake_call(text), text
 
 
@@ -163,12 +163,12 @@ async def test_dozing_ignores_speech_without_the_name(monkeypatch: Any) -> None:
 @pytest.mark.asyncio
 async def test_dozing_wakes_on_name_and_answers(monkeypatch: Any) -> None:
     """Calling the name wakes Reachy, re-enables auto responses, and answers this very turn."""
-    handler = _dozing_handler(monkeypatch, "小白，醒醒")
+    handler = _dozing_handler(monkeypatch, "风风，醒醒")
 
     await handler._run_realtime_session()
 
     assert not handler.is_dozing
-    assert {"role": "user", "content": "小白，醒醒"} in _messages(_drain(handler))
+    assert {"role": "user", "content": "风风，醒醒"} in _messages(_drain(handler))
     assert not handler._pending_responses.empty()
     handler.deps.movement_manager.set_dozing.assert_called_once_with(False)
     assert handler._turn_detection()["create_response"] is True
