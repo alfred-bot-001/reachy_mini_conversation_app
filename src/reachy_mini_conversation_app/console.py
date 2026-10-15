@@ -29,6 +29,7 @@ from reachy_mini_conversation_app.config import (
     set_custom_profile,
     get_available_voices,
     get_hf_direct_ws_url,
+    resolve_frame_clients,
     build_hf_direct_ws_url,
     has_hf_realtime_target,
     parse_hf_direct_target,
@@ -60,12 +61,13 @@ from reachy_mini_conversation_app.conversation_handler import ConversationHandle
 
 try:
     # FastAPI is provided by the Reachy Mini Apps runtime
-    from fastapi import FastAPI, Response
+    from fastapi import FastAPI, Request, Response
     from pydantic import BaseModel
     from fastapi.responses import FileResponse
     from starlette.staticfiles import StaticFiles
 except Exception:  # pragma: no cover - only loaded when settings_app is used
     FastAPI = object  # type: ignore
+    Request = object  # type: ignore
     FileResponse = object  # type: ignore
     StaticFiles = object  # type: ignore
     BaseModel = object  # type: ignore
@@ -526,6 +528,7 @@ class LocalStream:
                 "language": config.REALTIME_TRANSCRIPTION_LANGUAGE,
                 "memory_enabled": config.MEMORY_ENABLED,
                 "vision_enabled": bool(self._tool_deps and self._tool_deps.camera_enabled),
+                "dozing": bool(getattr(self.handler, "is_dozing", False)),
                 **backend_connection,
             }
 
@@ -538,6 +541,23 @@ class LocalStream:
         @settings_app.get("/favicon.ico")
         def _favicon() -> Response:
             return Response(status_code=204)
+
+        # The home server pulls a frame about once a second to recognise who is around; only allowlisted IPs.
+        frame_clients = resolve_frame_clients()
+
+        @settings_app.get("/api/camera/frame.jpg")
+        async def _camera_frame(request: Request) -> Response:
+            client = request.client.host if request.client else ""
+            if client not in frame_clients:
+                return Response(status_code=403)
+            try:
+                jpeg = await asyncio.to_thread(self._robot.media.get_frame_jpeg)
+            except Exception as e:
+                logger.debug("Camera frame unavailable: %s", e)
+                jpeg = None
+            if not jpeg:
+                return Response(status_code=503)
+            return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
         # ── JSON-RPC control surface (/rpc) ──────────────────────────────
         # The single wire format both the local browser UI and remote WebRTC

@@ -1045,3 +1045,30 @@ def test_rpc_settings_methods() -> None:
     assert isinstance(r2["result"], list)
     assert "spaces" in r3["result"]
     assert "enabled_tools" in r4["result"]
+
+
+def _frame_client(monkeypatch: pytest.MonkeyPatch, clients: str | None, jpeg: bytes | None) -> TestClient:
+    if clients is None:
+        monkeypatch.delenv("REACHY_MINI_FRAME_CLIENTS", raising=False)
+    else:
+        monkeypatch.setenv("REACHY_MINI_FRAME_CLIENTS", clients)
+    app = FastAPI()
+    media = SimpleNamespace(audio=None, backend=None, get_frame_jpeg=lambda: jpeg)
+    stream = LocalStream(MagicMock(), SimpleNamespace(media=media), settings_app=app)
+    stream._init_settings_ui_if_needed()
+    return TestClient(app)
+
+
+def test_camera_frame_is_served_only_to_allowlisted_clients(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The background face watcher may pull frames; any other LAN client is refused."""
+    allowed = _frame_client(monkeypatch, "testclient", b"\xff\xd8jpeg")
+    response = allowed.get("/api/camera/frame.jpg")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.content == b"\xff\xd8jpeg"
+
+    # Default allowlist is the home server only; the test client is not it.
+    assert _frame_client(monkeypatch, None, b"x").get("/api/camera/frame.jpg").status_code == 403
+    assert _frame_client(monkeypatch, "none", b"x").get("/api/camera/frame.jpg").status_code == 403
+    assert _frame_client(monkeypatch, "testclient", None).get("/api/camera/frame.jpg").status_code == 503
