@@ -132,8 +132,10 @@ DEFAULT_APP_TIMEOUT_MINUTES = 1440.0
 DOZE_MINUTES_ENV = "REACHY_MINI_DOZE_MINUTES"
 DEFAULT_DOZE_MINUTES = 30.0
 WAKE_WORDS_ENV = "REACHY_MINI_WAKE_WORDS"
-# The robot's name plus common speech-recognition homophones of it.
-DEFAULT_WAKE_WORDS = ("小白", "小百", "晓白", "小柏", "筱白", "小拜", "小摆", "小败", "xiaobai")
+# The robot's name "风风" (fēng fēng): any two of these homophones in a row, since speech recognition
+# often picks a different character for each syllable.
+_FENG_HOMOPHONES = "风峰丰锋枫疯蜂封烽沣凤"
+DEFAULT_WAKE_WORDS = tuple(a + b for a in _FENG_HOMOPHONES for b in _FENG_HOMOPHONES) + ("fengfeng",)
 
 
 FRAME_CLIENTS_ENV = "REACHY_MINI_FRAME_CLIENTS"
