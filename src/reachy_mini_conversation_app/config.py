@@ -131,6 +131,21 @@ WAKE_WORDS_ENV = "REACHY_MINI_WAKE_WORDS"
 DEFAULT_WAKE_WORDS = ("小白", "小百", "晓白", "小柏", "筱白", "小拜", "小摆", "小败", "xiaobai")
 
 
+FRAME_CLIENTS_ENV = "REACHY_MINI_FRAME_CLIENTS"
+# The home server that recognises faces in the background (agent001).
+DEFAULT_FRAME_CLIENTS = ("192.168.1.123",)
+
+
+def resolve_frame_clients() -> frozenset[str]:
+    """IP addresses allowed to pull camera frames; "none" disables the endpoint."""
+    raw_value = os.getenv(FRAME_CLIENTS_ENV)
+    if raw_value is None or not raw_value.strip():
+        return frozenset(DEFAULT_FRAME_CLIENTS)
+    if raw_value.strip().lower() == "none":
+        return frozenset()
+    return frozenset(part.strip() for part in raw_value.split(",") if part.strip())
+
+
 def speech_wobble_enabled() -> bool:
     """Return whether the head should wobble with the assistant's voice (off by default)."""
     return _env_flag("REACHY_MINI_SPEECH_WOBBLE", default=False)
