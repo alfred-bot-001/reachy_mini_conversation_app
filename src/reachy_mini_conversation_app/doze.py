@@ -3,12 +3,20 @@
 While dozing the microphone stays open and speech is still transcribed, but the backend is told not to answer
 (``turn_detection.create_response = false``). Only a transcript containing a wake word wakes Reachy up and gets
 answered; everything else is dropped from the conversation.
+
+A loud enough sound (sustained for a moment) also wakes Reachy, but lazily: it slowly lifts its head, stretches
+its antennas and looks left and right for whoever is there. If nobody talks to it within a short "drowsy" window it
+dozes off again, like a child who was only half woken by a noise.
 """
 
 from __future__ import annotations
 import re
+import math
 import time
 from collections.abc import Iterable
+
+import numpy as np
+from numpy.typing import NDArray
 
 
 def _normalize(text: str) -> str:
@@ -55,3 +63,52 @@ class DozeState:
         self.dozing = False
         self.since = None
         return True
+
+
+def level_dbfs(frame: NDArray[np.int16]) -> float:
+    """Return the RMS level of an int16 frame in dBFS (0 = full scale, silence about -96)."""
+    if frame.size == 0:
+        return -96.0
+    rms = float(np.sqrt(np.mean(np.square(frame.astype(np.float64)))))
+    return 20.0 * math.log10(max(rms, 1.0) / 32768.0)
+
+
+class LoudnessTrigger:
+    """Decide when the room got loud enough, for long enough, to wake a dozing Reachy.
+
+    Loud audio fills a small bucket and quiet audio drains it at half speed, so a sustained noise (talking, a door,
+    someone moving around) wakes Reachy while a single click does not. After firing it stays quiet for a cooldown.
+    The loudest level heard is kept so it can be logged to tune the threshold for the room.
+    """
+
+    def __init__(self, threshold_dbfs: float, hold_s: float, cooldown_s: float = 60.0) -> None:
+        """Fire once ``hold_s`` seconds of audio at or above ``threshold_dbfs`` have built up."""
+        self.threshold_dbfs = threshold_dbfs
+        self.hold_s = hold_s
+        self.cooldown_s = cooldown_s
+        self._loud_s = 0.0
+        self._quiet_until = 0.0
+        self.peak_dbfs = -96.0
+
+    def reset(self) -> None:
+        """Forget accumulated loudness (e.g. when Reachy falls asleep again)."""
+        self._loud_s = 0.0
+        self.peak_dbfs = -96.0
+
+    def feed(self, frame: NDArray[np.int16], sample_rate: int, now: float | None = None) -> bool:
+        """Account one microphone frame; return True when Reachy should wake up."""
+        now = time.monotonic() if now is None else now
+        level = level_dbfs(frame)
+        self.peak_dbfs = max(self.peak_dbfs, level)
+        if now < self._quiet_until:
+            return False
+        duration = frame.shape[0] / float(sample_rate or 16000)
+        if level >= self.threshold_dbfs:
+            self._loud_s += duration
+        else:
+            self._loud_s = max(0.0, self._loud_s - duration / 2)
+        if self._loud_s >= self.hold_s:
+            self._loud_s = 0.0
+            self._quiet_until = now + self.cooldown_s
+            return True
+        return False

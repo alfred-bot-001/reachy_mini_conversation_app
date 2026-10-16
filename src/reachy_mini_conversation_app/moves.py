@@ -8,7 +8,9 @@ Design overview
 - Idle behaviour starts an infinite `BreathingMove` after a short inactivity delay
   unless listening is active.
 - Dozing replaces everything with an infinite `DozeMove` (head tucked, antennas
-  folded) and rejects new moves until woken.
+  folded) and rejects new moves until woken. A loud noise wakes it with a
+  `LazyWakeMove` (slow rise, stretch, drowsy tilt, look left and right) instead
+  of the plain rise to breathing.
 
 Threading model
 - A dedicated worker thread owns all real-time state and issues `set_target`
@@ -157,6 +159,49 @@ class DozeMove(Move):  # type: ignore
         head_pose = linear_pose_interpolation(self.start_pose, self.sleep_pose, s)
         antennas = (1 - s) * self.start_antennas + s * self.sleep_antennas
         return (head_pose, antennas.astype(np.float64), 0.0)
+
+
+# (seconds from start, roll°, pitch°, yaw°, z in m, (left, right) antennas in rad); pitch > 0 looks down.
+LAZY_WAKE_KEYFRAMES: Tuple[Tuple[float, float, float, float, float, Tuple[float, float]], ...] = (
+    (4.0, 0.0, 14.0, 0.0, -0.015, (-0.9, 0.9)),  # slowly lift the head, still drowsy, antennas half up
+    (5.2, 0.0, 6.0, 0.0, -0.005, (-0.35, 0.35)),  # stretch: antennas up
+    (6.4, 9.0, 8.0, 0.0, -0.005, (-0.6, 0.25)),  # drowsy head tilt, one antenna droops
+    (7.4, 0.0, 0.0, 0.0, 0.0, (-0.1745, 0.1745)),  # straighten up
+    (9.0, 0.0, -2.0, 32.0, 0.0, (-0.1745, 0.1745)),  # look to the left for someone
+    (10.2, 0.0, -2.0, 32.0, 0.0, (-0.2, 0.25)),  # linger
+    (12.6, 0.0, -2.0, -32.0, 0.0, (-0.25, 0.2)),  # look to the right
+    (13.8, 0.0, -2.0, -32.0, 0.0, (-0.1745, 0.1745)),  # linger
+    (15.4, 0.0, 0.0, 0.0, 0.0, (-0.1745, 0.1745)),  # back to the middle
+)
+
+
+class LazyWakeMove(Move):  # type: ignore
+    """Wake up slowly from the doze pose like a sleepy child, then look around for whoever made the noise."""
+
+    def __init__(self, start_pose: NDArray[np.float32], start_antennas: Tuple[float, float]):
+        """Start from the currently commanded (doze) pose."""
+        self.keyframes: list[tuple[float, NDArray[np.float64], NDArray[np.float64]]] = [
+            (0.0, np.array(start_pose, dtype=np.float64), np.array(start_antennas, dtype=np.float64))
+        ]
+        for at, roll, pitch, yaw, z, antennas in LAZY_WAKE_KEYFRAMES:
+            pose = create_head_pose(x=0, y=0, z=z, roll=roll, pitch=pitch, yaw=yaw, degrees=True, mm=False)
+            self.keyframes.append((at, np.array(pose, dtype=np.float64), np.array(antennas, dtype=np.float64)))
+
+    @property
+    def duration(self) -> float:
+        """Total length of the wake-up."""
+        return float(self.keyframes[-1][0])
+
+    def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+        """Ease between keyframes with a cosine curve so every motion starts and ends gently."""
+        t = max(0.0, t)
+        for (t0, pose0, ant0), (t1, pose1, ant1) in zip(self.keyframes, self.keyframes[1:]):
+            if t <= t1:
+                s = 0.5 - 0.5 * np.cos(np.pi * (t - t0) / (t1 - t0))
+                head = linear_pose_interpolation(pose0, pose1, s)
+                return (head, ((1 - s) * ant0 + s * ant1).astype(np.float64), 0.0)
+        _, pose, antennas = self.keyframes[-1]
+        return (pose.copy(), antennas.copy(), 0.0)
 
 
 def clone_full_body_pose(pose: FullBodyPose) -> FullBodyPose:
@@ -335,6 +380,10 @@ class MovementManager:
         """
         self._command_queue.put(("set_dozing", dozing))
 
+    def wake_lazily(self) -> None:
+        """Leave the doze pose with the slow, sleepy wake-up and a look around (thread-safe)."""
+        self._command_queue.put(("lazy_wake", None))
+
     def set_speaking(self, speaking: bool) -> None:
         """Pause head tracking while the assistant speaks, resume it afterwards.
 
@@ -436,6 +485,8 @@ class MovementManager:
                 logger.warning("Head-tracking toggle failed: %s", e)
         elif command == "set_dozing":
             self._set_dozing(bool(payload), current_time)
+        elif command == "lazy_wake":
+            self._set_dozing(False, current_time, lazy=True)
         elif command == "set_speaking":
             if not self._head_tracking or self._dozing:
                 return
@@ -456,7 +507,7 @@ class MovementManager:
         else:
             logger.warning("Unknown command received by MovementManager: %s", command)
 
-    def _set_dozing(self, dozing: bool, current_time: float) -> None:
+    def _set_dozing(self, dozing: bool, current_time: float, lazy: bool = False) -> None:
         """Enter or leave the doze pose (worker thread only)."""
         if self._dozing == dozing:
             return
@@ -469,6 +520,12 @@ class MovementManager:
             self.state.current_move = DozeMove(start_pose=head, start_antennas=antennas)
             self._breathing_active = False
             logger.info("Dozing: tucking the head and holding still")
+        elif lazy:
+            # Breathing resumes by itself once the wake-up move finishes.
+            self.state.current_move = LazyWakeMove(start_pose=head, start_antennas=antennas)
+            self._breathing_active = False
+            self.state.update_activity()
+            logger.info("Waking up lazily from doze: stretching and looking around")
         else:
             # Breathing starts with a slow interpolation back to neutral, so waking up rises gently.
             self.state.current_move = BreathingMove(

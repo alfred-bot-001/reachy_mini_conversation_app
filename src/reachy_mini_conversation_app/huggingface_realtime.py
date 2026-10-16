@@ -26,18 +26,20 @@ from openai.types.realtime import (
 from websockets.exceptions import ConnectionClosedError
 from openai.types.realtime.realtime_audio_input_turn_detection_param import ServerVad
 
-from reachy_mini_conversation_app.doze import DozeState
+from reachy_mini_conversation_app.doze import DozeState, LoudnessTrigger
 from reachy_mini_conversation_app.tools import core_tools
 from reachy_mini_conversation_app.config import (
     HF_LOCAL_CONNECTION_MODE,
     config,
     get_default_voice,
+    resolve_loud_wake,
     resolve_wake_words,
     set_custom_profile,
     get_available_voices,
     get_hf_direct_ws_url,
     resolve_doze_minutes,
     parse_hf_realtime_url,
+    resolve_drowsy_minutes,
     get_hf_connection_selection,
 )
 from reachy_mini_conversation_app.prompts import (
@@ -168,6 +170,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._tool_batch_needs_response = False
         doze_minutes = resolve_doze_minutes()
         self._doze = DozeState(doze_minutes * 60.0 if doze_minutes else None, resolve_wake_words())
+        loud_wake = resolve_loud_wake()
+        self._loud = LoudnessTrigger(*loud_wake) if loud_wake else None
+        self._drowsy_s = resolve_drowsy_minutes() * 60.0
+        self._drowsy_until: float | None = None  # lazily woken: doze off again if nobody engages by then
+        self._drowsy_activity = 0.0
+        self.lazy_woke_at: float | None = None  # monotonic time of the last loud-noise wake-up
+        self._peak_logged_at = time.monotonic()
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -278,14 +287,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.warning("Failed to update turn detection for doze: %s", e)
 
     async def _maybe_doze(self) -> None:
-        """Doze after a long silence once nothing is pending."""
+        """Doze after a long silence once nothing is pending (sooner if only half woken by a noise)."""
+        if self._drowsy_until is not None and self.last_activity_time > self._drowsy_activity:
+            self._drowsy_until = None  # someone engaged: fully awake now
+        drowsy_over = self._drowsy_until is not None and time.monotonic() >= self._drowsy_until
         if (
-            self._doze.should_doze(time.monotonic() - self.last_activity_time)
+            (self._doze.should_doze(time.monotonic() - self.last_activity_time) or drowsy_over)
             and self._is_connected()
             and self._response_done_event.is_set()
             and self._pending_responses.empty()
             and not self._in_flight_tool_calls
         ):
+            if drowsy_over:
+                logger.info("Nobody engaged after the noise; dozing off again")
             await self.fall_asleep()
 
     async def fall_asleep(self) -> None:
@@ -296,16 +310,44 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             "No conversation for %.0f minutes; dozing until called by name", (self._doze.doze_after_s or 0) / 60
         )
         self.deps.movement_manager.set_dozing(True)
+        self._drowsy_until = None
+        if self._loud is not None:
+            self._loud.reset()
         await self._send_turn_detection()
 
-    async def wake_up(self, reason: str) -> None:
-        """Leave doze: raise the head and answer again."""
+    async def wake_up(self, reason: str, lazy: bool = False) -> None:
+        """Leave doze: raise the head and answer again.
+
+        ``lazy`` (woken by a noise) plays the slow stretch-and-look-around wake-up and dozes off again after the
+        drowsy window unless somebody talks to Reachy.
+        """
         if not self._doze.wake():
             return
-        logger.info("Waking up from doze (%s)", reason)
-        self.deps.movement_manager.set_dozing(False)
+        logger.info("Waking up from doze (%s%s)", reason, ", lazily" if lazy else "")
+        if lazy:
+            self.deps.movement_manager.wake_lazily()
+        else:
+            self.deps.movement_manager.set_dozing(False)
         await self._send_turn_detection()
         self._mark_activity(f"wake_{reason}")
+        if lazy:
+            self.lazy_woke_at = time.monotonic()
+            self._drowsy_activity = self.last_activity_time
+            self._drowsy_until = self.lazy_woke_at + self._drowsy_s
+        else:
+            self._drowsy_until = None
+
+    def _listen_while_dozing(self, sample_rate: int, audio_frame: NDArray[np.int16]) -> None:
+        """While dozing, wake up lazily once the room has been loud for a moment."""
+        if self._loud is None or not self._doze.dozing:
+            return
+        now = time.monotonic()
+        if now - self._peak_logged_at >= 300:  # helps tune REACHY_MINI_LOUD_WAKE_DBFS for the room
+            logger.info("Dozing: loudest sound in the last 5 minutes %.1f dBFS", self._loud.peak_dbfs)
+            self._loud.peak_dbfs, self._peak_logged_at = -96.0, now
+        if self._loud.feed(audio_frame, sample_rate, now):
+            logger.info("Loud sound while dozing (>= %.0f dBFS); waking up lazily", self._loud.threshold_dbfs)
+            asyncio.get_running_loop().create_task(self.wake_up("loud_sound", lazy=True))
 
     async def emit(self) -> Any:
         """Check for doze before emitting the next output."""
@@ -1048,7 +1090,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not self.connection:
             return
 
-        _, audio_frame = frame
+        sample_rate, audio_frame = frame
         if audio_frame.size == 0:
             return
 
@@ -1063,6 +1105,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         # Cast if needed
         audio_frame = audio_to_int16(audio_frame)
+        self._listen_while_dozing(sample_rate, audio_frame)
 
         # Send to the realtime input buffer (guard against races during reconnect).
         try:

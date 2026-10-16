@@ -557,7 +557,13 @@ class LocalStream:
                 jpeg = None
             if not jpeg:
                 return Response(status_code=503)
-            return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+            # The home face watcher only counts people Reachy actually saw: not while dozing (head tucked).
+            dozing = bool(getattr(self.handler, "is_dozing", False))
+            headers = {"Cache-Control": "no-store", "X-Reachy-Dozing": "1" if dozing else "0"}
+            woke_at = getattr(self.handler, "lazy_woke_at", None)
+            if woke_at is not None:
+                headers["X-Reachy-Lazy-Woke-Ago"] = str(int(time.monotonic() - woke_at))
+            return Response(content=jpeg, media_type="image/jpeg", headers=headers)
 
         # ── JSON-RPC control surface (/rpc) ──────────────────────────────
         # The single wire format both the local browser UI and remote WebRTC
