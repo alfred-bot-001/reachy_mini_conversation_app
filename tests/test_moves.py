@@ -219,3 +219,106 @@ def test_handle_command_queue_and_clear() -> None:
     manager._handle_command("clear_queue", None, now)
     assert len(manager.move_queue) == 0
     assert manager.state.current_move is None
+
+
+class _Face:
+    def __init__(self, detected: bool, x: float | None = None) -> None:
+        self.detected = detected
+        self.x = x
+        self.y = 0.0 if detected else None
+
+
+def _tracking_manager(face: _Face, head_yaw_deg: float = 0.0) -> tuple[MovementManager, MagicMock]:
+    robot = MagicMock()
+    robot.get_tracked_face.return_value = face
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, head_yaw_deg, degrees=True)
+    manager = MovementManager(robot)
+    manager._head_tracking = True
+    return manager, robot
+
+
+def _commanded_yaw_deg(manager: MovementManager, t: float) -> float:
+    head, _, _ = manager.state.current_move.evaluate(t)
+    return float(np.degrees(np.arctan2(head[1, 0], head[0, 0])))
+
+
+def test_look_toward_turns_to_a_voice_away_from_the_tracked_face_then_resumes_tracking() -> None:
+    """A voice 40° left of a centred face pauses tracking, turns the head there and hands it back."""
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0))
+    now = manager._now()
+
+    manager._handle_command("look_toward", np.radians(40), now)
+
+    robot.start_head_tracking.assert_called_once_with(weight=0.0)
+    assert manager.get_status()["turning"] is True
+    assert isinstance(manager.state.current_move, GotoQueueMove)
+    assert _commanded_yaw_deg(manager, 0.0) == pytest.approx(0.0, abs=0.5)
+    assert _commanded_yaw_deg(manager, 10.0) == pytest.approx(40.0, abs=0.5)
+
+    manager._finish_turn(now + 0.1)
+    assert manager.get_status()["turning"] is True
+    manager._finish_turn(now + 1.0)
+    assert manager.get_status()["turning"] is False
+    robot.start_head_tracking.assert_called_with(weight=1.0)
+
+
+def test_look_toward_ignores_a_voice_from_the_tracked_face() -> None:
+    """The person already being looked at keeps talking: no turn, tracking stays on."""
+    # Face 20° to the right of the image centre (x > 0) and a voice ~25° right of the head.
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.38))
+    manager._handle_command("look_toward", np.radians(-25), manager._now())
+    robot.start_head_tracking.assert_not_called()
+    assert manager.state.current_move is None
+
+
+def test_look_toward_without_a_face_turns_only_for_clear_offsets_and_clamps_the_neck() -> None:
+    """No face locked: small offsets are left to the tracker; large ones turn as far as the neck allows."""
+    manager, robot = _tracking_manager(_Face(detected=False))
+    manager._handle_command("look_toward", np.radians(8), manager._now())
+    robot.start_head_tracking.assert_not_called()
+
+    manager, robot = _tracking_manager(_Face(detected=False), head_yaw_deg=30)
+    manager._handle_command("look_toward", np.radians(-100), manager._now())
+    assert _commanded_yaw_deg(manager, 10.0) == pytest.approx(-60.0, abs=0.5)
+
+
+def test_look_toward_is_blocked_while_speaking_dozing_untracked_or_cooling_down() -> None:
+    """Reachy keeps still while it talks or dozes, never turns with tracking off, and not twice in a row."""
+    manager, robot = _tracking_manager(_Face(detected=False))
+    yaw = np.radians(45)
+    now = manager._now()
+
+    manager._is_speaking = True
+    manager._handle_command("look_toward", yaw, now)
+    manager._is_speaking = False
+    manager._dozing = True
+    manager._handle_command("look_toward", yaw, now)
+    manager._dozing = False
+    manager._head_tracking = False
+    manager._handle_command("look_toward", yaw, now)
+    robot.start_head_tracking.assert_not_called()
+
+    manager._head_tracking = True
+    manager._handle_command("look_toward", yaw, now)
+    robot.start_head_tracking.assert_called_once_with(weight=0.0)
+    manager._finish_turn(now + 1.0)
+    manager._handle_command("look_toward", yaw, now + 1.0)
+    assert manager.get_status()["turning"] is False  # within the cooldown
+    manager._handle_command("look_toward", yaw, now + 3.0)
+    assert manager.get_status()["turning"] is True
+
+
+def test_dozing_cancels_a_turn_and_listening_notifies_attention() -> None:
+    """Dozing mid-turn must not resume tracking afterwards; listening toggles reach speaker attention."""
+    manager, robot = _tracking_manager(_Face(detected=False))
+    now = manager._now()
+    manager._handle_command("look_toward", np.radians(45), now)
+    manager._handle_command("set_dozing", True, now)
+    robot.start_head_tracking.reset_mock()
+    manager._finish_turn(now + 1.0)
+    robot.start_head_tracking.assert_not_called()
+
+    heard: list[bool] = []
+    manager.on_listening = heard.append
+    manager.set_listening(True)
+    assert heard == [True]

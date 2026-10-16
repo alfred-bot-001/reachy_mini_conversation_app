@@ -230,6 +230,27 @@ class LocalStream:
         if self._rpc is not None:
             self._rpc.broadcast_threadsafe("conversation.phase", {"phase": phase, "reason": reason})
 
+    def _tracked_face(self) -> tuple[float, float] | None:
+        """Normalised image position of the face the daemon's tracker follows, or None."""
+        try:
+            face = self._robot.get_tracked_face(wait=False)
+            if not face.detected or face.x is None or face.y is None:
+                return None
+            return float(face.x), float(face.y)
+        except Exception as e:
+            logger.debug("Tracked face unavailable: %s", e)
+            return None
+
+    def _face_follow_status(self) -> dict[str, object]:
+        """Whether the head follows faces, whether it is mid-turn toward a voice, and the face it follows."""
+        movement = self.handler.deps.movement_manager.get_status()
+        tracked_face = self._tracked_face()
+        return {
+            "tracking": bool(movement.get("head_tracking")),
+            "turning": bool(movement.get("turning")),
+            "face": None if tracked_face is None else {"x": tracked_face[0], "y": tracked_face[1]},
+        }
+
     def seconds_since_activity(self) -> float:
         """Seconds since the live handler last saw conversation activity."""
         return time.monotonic() - self.handler.last_activity_time
@@ -529,6 +550,7 @@ class LocalStream:
                 "memory_enabled": config.MEMORY_ENABLED,
                 "vision_enabled": bool(self._tool_deps and self._tool_deps.camera_enabled),
                 "dozing": bool(getattr(self.handler, "is_dozing", False)),
+                "face_follow": self._face_follow_status(),
                 **backend_connection,
             }
 
@@ -563,6 +585,10 @@ class LocalStream:
             woke_at = getattr(self.handler, "lazy_woke_at", None)
             if woke_at is not None:
                 headers["X-Reachy-Lazy-Woke-Ago"] = str(int(time.monotonic() - woke_at))
+            tracked_face = self._tracked_face()
+            if tracked_face is not None:
+                # Lets the face watcher tell which recognised face Reachy is looking at (the likely speaker).
+                headers["X-Tracked-Face"] = f"{tracked_face[0]:.4f},{tracked_face[1]:.4f}"
             return Response(content=jpeg, media_type="image/jpeg", headers=headers)
 
         # ── JSON-RPC control surface (/rpc) ──────────────────────────────
