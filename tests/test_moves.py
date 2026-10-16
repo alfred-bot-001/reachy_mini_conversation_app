@@ -380,20 +380,41 @@ def test_a_face_the_head_cannot_reach_pauses_tracking_holds_the_pose_and_retries
     assert manager._limit_hold_until == pytest.approx(resumed_at + 0.8 + 2 * LIMIT_HOLD_S)
 
 
-def test_tracking_keeps_going_while_the_head_still_moves_or_the_face_is_centred() -> None:
-    """A head still on its way to the face, or a face already centred, is never mistaken for a limit."""
+def test_tracking_keeps_going_while_the_head_still_moves_or_is_not_over_to_the_face_side() -> None:
+    """A head still moving, settled near neutral (faces sit a little high), or pitched the other way is no limit."""
     face = _Face(detected=True, x=0.0, y=0.7)
     manager, robot = _tracking_manager(face)
     now = manager._now()
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 32, 0, degrees=True)
     manager._guard_limits(now)
-    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 5, 0, degrees=True)
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 36, 0, degrees=True)
     manager._guard_limits(now + 0.7)
-    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 10, 0, degrees=True)
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 40, 0, degrees=True)
     manager._guard_limits(now + 1.4)
-    face.y = 0.1
-    manager._guard_limits(now + 1.5)
-    manager._guard_limits(now + 2.5)
     robot.start_head_tracking.assert_not_called()
+
+    # Converged on the real robot: face 0.38 above centre, head level and still for ages.
+    face.y = -0.38
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, -2, 0, degrees=True)
+    for seconds in (2.0, 3.0, 4.0, 10.0):
+        manager._guard_limits(now + seconds)
+    robot.start_head_tracking.assert_not_called()
+
+    # Pitched well down but the face is above: the head can come back up, nothing is blocked.
+    face.y = -0.5
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 35, 0, degrees=True)
+    for seconds in (11.0, 12.0, 13.0):
+        manager._guard_limits(now + seconds)
+    robot.start_head_tracking.assert_not_called()
+
+
+def test_a_neck_at_its_limit_with_the_face_further_round_is_a_limit_too() -> None:
+    """Looking 55° left of the body with the face still further left (image x < 0) and the head still."""
+    manager, robot = _tracking_manager(_Face(detected=True, x=-0.4), head_yaw_deg=55)
+    now = manager._now()
+    manager._guard_limits(now)
+    manager._guard_limits(now + 0.7)
+    robot.start_head_tracking.assert_called_once_with(weight=0.0)
 
 
 def test_dozing_cancels_a_turn_and_listening_notifies_attention() -> None:

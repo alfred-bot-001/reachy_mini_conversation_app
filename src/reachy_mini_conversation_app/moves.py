@@ -74,8 +74,11 @@ BODY_FOLLOW_DELAY_S = 0.5
 BODY_FOLLOW_DURATION_S = 1.0
 MAX_BODY_YAW_RAD = math.radians(150)  # the daemon stops the body at ±160°
 
-# Limit hold: the tracker keeps asking for a face it can't reach (below the chin, say) and the head no longer moves
-LIMIT_FACE_OFFSET = 0.2  # normalised image coordinates; the tracker centres a face closer than this
+# Limit hold: the head is already well over to one side, the face sits further out that way, and nothing moves.
+# The daemon tracker settles with the face a little above centre, so an offset alone never counts as a limit.
+LIMIT_PITCH_RAD = math.radians(30)
+LIMIT_NECK_YAW_RAD = math.radians(50)
+LIMIT_FACE_OFFSET = 0.2  # normalised image coordinates
 LIMIT_STILL_RAD = math.radians(1.5)
 LIMIT_STILL_S = 0.6
 LIMIT_HOLD_S = 3.0
@@ -237,6 +240,11 @@ class LazyWakeMove(Move):  # type: ignore
 def head_yaw(pose: NDArray[np.float64]) -> float:
     """Yaw of a head pose in the world frame (positive = left)."""
     return math.atan2(pose[1, 0], pose[0, 0])
+
+
+def head_pitch(pose: NDArray[np.float64]) -> float:
+    """Pitch of a head pose in the world frame (positive = nose down)."""
+    return -math.asin(max(-1.0, min(1.0, float(pose[2, 0]))))
 
 
 def rotation_between(a: NDArray[np.float64], b: NDArray[np.float64]) -> float:
@@ -727,6 +735,7 @@ class MovementManager:
         try:
             face = self.current_robot.get_tracked_face(wait=False)
             head_pose = self.current_robot.get_current_head_pose()
+            body_yaw = self._present_body_yaw()
         except Exception as e:
             logger.warning("Cannot check the tracking limits, robot state unavailable: %s", e)
             self._still_since = None
@@ -734,9 +743,16 @@ class MovementManager:
         if not face.detected or face.x is None or face.y is None:
             self._still_since = None
             return
-        if max(abs(face.x), abs(face.y)) <= LIMIT_FACE_OFFSET:
+        # Image y grows downward like a nose-down pitch; image x grows to the right, against a leftward yaw.
+        pitch = head_pitch(head_pose)
+        neck_yaw = wrap_angle(head_yaw(head_pose) - body_yaw)
+        face_beyond_pitch = abs(pitch) >= LIMIT_PITCH_RAD and face.y * pitch > 0 and abs(face.y) > LIMIT_FACE_OFFSET
+        face_beyond_yaw = (
+            abs(neck_yaw) >= LIMIT_NECK_YAW_RAD and face.x * neck_yaw < 0 and abs(face.x) > LIMIT_FACE_OFFSET
+        )
+        if not (face_beyond_pitch or face_beyond_yaw):
             self._still_since = None
-            self._limit_hold_s = LIMIT_HOLD_S  # the face is reachable again
+            self._limit_hold_s = LIMIT_HOLD_S  # the face is within reach again
             return
         if self._still_since is None or rotation_between(self._still_since[1], head_pose) > LIMIT_STILL_RAD:
             self._still_since = (current_time, head_pose)
