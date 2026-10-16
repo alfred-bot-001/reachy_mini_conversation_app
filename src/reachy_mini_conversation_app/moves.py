@@ -13,6 +13,10 @@ Design overview
   of the plain rise to breathing.
 - With head tracking on, a voice from off to the side turns the head that way
   (tracking paused for the turn) so the daemon's tracker re-acquires the speaker.
+- Face following knows its limits: a neck held well round turns the body under the
+  head, and when the head stops short of the face (a joint limit) tracking pauses
+  and the pose is held instead of straining, with a retry a little later.
+- Body yaw is held between moves: only goto moves set it, other moves offset it.
 
 Threading model
 - A dedicated worker thread owns all real-time state and issues `set_target`
@@ -63,6 +67,20 @@ MAX_HEAD_YAW_RAD = math.radians(60)
 MIN_TURN_RAD = math.radians(12)  # smaller offsets are left to the tracker
 SAME_SPEAKER_RAD = math.radians(25)  # DoA error band: a voice this close to the tracked face is that person
 CAMERA_HALF_WIDTH_TAN = 0.96  # tan(half horizontal FOV) of the Reachy Mini camera (fx 2002 px, 3840 px wide)
+
+# Following with the body: a neck held this far round for a moment turns the body under the head
+BODY_FOLLOW_YAW_RAD = math.radians(40)
+BODY_FOLLOW_DELAY_S = 0.5
+BODY_FOLLOW_DURATION_S = 1.0
+MAX_BODY_YAW_RAD = math.radians(150)  # the daemon stops the body at ±160°
+
+# Limit hold: the tracker keeps asking for a face it can't reach (below the chin, say) and the head no longer moves
+LIMIT_FACE_OFFSET = 0.2  # normalised image coordinates; the tracker centres a face closer than this
+LIMIT_STILL_RAD = math.radians(1.5)
+LIMIT_STILL_S = 0.6
+LIMIT_HOLD_S = 3.0
+LIMIT_HOLD_MAX_S = 12.0
+LIMIT_RETRY_WINDOW_S = 1.5  # stuck again this soon after a hold: hold twice as long next time
 
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
@@ -216,6 +234,17 @@ class LazyWakeMove(Move):  # type: ignore
         return (pose.copy(), antennas.copy(), 0.0)
 
 
+def head_yaw(pose: NDArray[np.float64]) -> float:
+    """Yaw of a head pose in the world frame (positive = left)."""
+    return math.atan2(pose[1, 0], pose[0, 0])
+
+
+def rotation_between(a: NDArray[np.float64], b: NDArray[np.float64]) -> float:
+    """Angle in radians between the orientations of two poses."""
+    cos = (np.trace(a[:3, :3].T @ b[:3, :3]) - 1.0) / 2.0
+    return math.acos(max(-1.0, min(1.0, float(cos))))
+
+
 def clone_full_body_pose(pose: FullBodyPose) -> FullBodyPose:
     """Create a deep copy of a full body pose tuple."""
     head, antennas, body_yaw = pose
@@ -321,6 +350,15 @@ class MovementManager:
         self._dozing = False  # true while holding the doze pose; new moves are rejected
         self._turn_until: float | None = None  # end of a turn toward a voice; tracking resumes then
         self._last_turn_time = -TURN_COOLDOWN_S
+        self._held_body_yaw = 0.0  # body yaw between goto moves, so breathing doesn't undo a body turn
+        self._body_turn_until: float | None = None
+        self._neck_twisted_since: float | None = None
+        # Head pose held, and since when, while the tracked face sits off-centre: no motion means a limit.
+        self._still_since: tuple[float, NDArray[np.float64]] | None = None
+        self._limit_anchor: NDArray[np.float64] | None = None  # pose held while tracking is paused at a limit
+        self._limit_hold_until: float | None = None
+        self._limit_hold_s = LIMIT_HOLD_S
+        self._limit_retry_until: float | None = None
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
         self._last_set_target_err = 0.0
@@ -499,6 +537,7 @@ class MovementManager:
             self._head_tracking = enabled
             self._track_anchor = None
             self._turn_until = None
+            self._reset_follow_state()
             # set_speaking is gated off while disabled, so its state would go stale across a toggle.
             self._is_speaking = False
             if self._dozing:
@@ -530,6 +569,7 @@ class MovementManager:
                     self.current_robot.start_head_tracking(weight=0.0)
                 elif not speaking:
                     self._track_anchor = None
+                    self._reset_follow_state()
                     self.current_robot.start_head_tracking(weight=1.0)
             except Exception as e:
                 logger.warning("Head-tracking speaking handoff failed: %s", e)
@@ -545,6 +585,7 @@ class MovementManager:
         try:
             face = self.current_robot.get_tracked_face(wait=False)
             head_pose = self.current_robot.get_current_head_pose()
+            body_yaw = self._present_body_yaw()
         except Exception as e:
             logger.warning("Cannot turn toward the voice, robot state unavailable: %s", e)
             return
@@ -555,10 +596,11 @@ class MovementManager:
                 return
         elif abs(yaw) < MIN_TURN_RAD:
             return
-        current_yaw = math.atan2(head_pose[1, 0], head_pose[0, 0])
-        target_yaw = max(-MAX_HEAD_YAW_RAD, min(MAX_HEAD_YAW_RAD, current_yaw + yaw))
-        if abs(target_yaw - current_yaw) < MIN_TURN_RAD:
+        neck_yaw = wrap_angle(head_yaw(head_pose) - body_yaw)
+        target_neck_yaw = max(-MAX_HEAD_YAW_RAD, min(MAX_HEAD_YAW_RAD, neck_yaw + yaw))
+        if abs(target_neck_yaw - neck_yaw) < MIN_TURN_RAD:
             return
+        target_yaw = body_yaw + target_neck_yaw
         try:
             # Weight 0 pauses detection but keeps the tracker's face association, so on resume it picks
             # the face nearest where the last one was: the centre, where the speaker now is.
@@ -566,6 +608,7 @@ class MovementManager:
         except Exception as e:
             logger.warning("Could not pause head tracking to turn toward the voice: %s", e)
             return
+        self._reset_follow_state()
         antennas = self._last_commanded_pose[1]
         self.move_queue.clear()
         self.state.current_move = GotoQueueMove(
@@ -573,6 +616,8 @@ class MovementManager:
             start_head_pose=head_pose,
             target_antennas=antennas,
             start_antennas=antennas,
+            target_body_yaw=body_yaw,
+            start_body_yaw=body_yaw,
             duration=TURN_DURATION_S,
         )
         self.state.move_start_time = current_time
@@ -586,6 +631,134 @@ class MovementManager:
             math.degrees(yaw),
             "yes" if face.detected else "none",
             math.degrees(target_yaw),
+        )
+
+    def _present_body_yaw(self) -> float:
+        return float(self.current_robot.get_current_joint_positions()[0][0])
+
+    def _tracking_live(self) -> bool:
+        """Whether the daemon tracker owns the head right now (worker thread only)."""
+        return (
+            self._head_tracking
+            and not self._dozing
+            and not self._is_speaking
+            and self._turn_until is None
+            and self._limit_hold_until is None
+        )
+
+    def _reset_follow_state(self) -> None:
+        """Forget body-follow and limit-hold progress; callers decide whether tracking (re)starts."""
+        self._body_turn_until = None
+        self._neck_twisted_since = None
+        self._still_since = None
+        self._limit_anchor = None
+        self._limit_hold_until = None
+
+    def _follow_with_body(self, current_time: float) -> None:
+        """Turn the body under the head once the neck has been held well round toward the tracked face."""
+        if self._body_turn_until is not None:
+            if current_time >= self._body_turn_until:
+                self._body_turn_until = None
+            return
+        if not self._tracking_live():
+            self._neck_twisted_since = None
+            return
+        try:
+            face = self.current_robot.get_tracked_face(wait=False)
+            head_pose = self.current_robot.get_current_head_pose()
+            body_yaw = self._present_body_yaw()
+        except Exception as e:
+            logger.warning("Cannot follow with the body, robot state unavailable: %s", e)
+            return
+        neck_yaw = wrap_angle(head_yaw(head_pose) - body_yaw)
+        if not face.detected or abs(neck_yaw) < BODY_FOLLOW_YAW_RAD:
+            self._neck_twisted_since = None
+            return
+        if self._neck_twisted_since is None:
+            self._neck_twisted_since = current_time
+            return
+        if current_time - self._neck_twisted_since < BODY_FOLLOW_DELAY_S:
+            return
+        self._neck_twisted_since = None
+        target_body_yaw = max(-MAX_BODY_YAW_RAD, min(MAX_BODY_YAW_RAD, body_yaw + neck_yaw))
+        if abs(target_body_yaw - body_yaw) < MIN_TURN_RAD:
+            return  # the body is at its own limit
+        # Tracking keeps the head on the face in the world frame while the body swings round beneath it.
+        antennas = self._last_commanded_pose[1]
+        self.move_queue.clear()
+        self.state.current_move = GotoQueueMove(
+            target_head_pose=head_pose,
+            start_head_pose=head_pose,
+            target_antennas=antennas,
+            start_antennas=antennas,
+            target_body_yaw=target_body_yaw,
+            start_body_yaw=body_yaw,
+            duration=BODY_FOLLOW_DURATION_S,
+        )
+        self.state.move_start_time = current_time
+        self.state.update_activity()
+        self._breathing_active = False
+        self._body_turn_until = current_time + BODY_FOLLOW_DURATION_S
+        logger.info(
+            "Neck %.0f° round for %.1fs; turning the body to %.0f°",
+            math.degrees(neck_yaw),
+            BODY_FOLLOW_DELAY_S,
+            math.degrees(target_body_yaw),
+        )
+
+    def _guard_limits(self, current_time: float) -> None:
+        """Stop straining against a joint limit: hold still while the head can't reach the face, retry later."""
+        if self._limit_hold_until is not None:
+            if current_time < self._limit_hold_until:
+                return
+            self._limit_hold_until = None
+            self._limit_anchor = None
+            self._limit_retry_until = current_time + LIMIT_RETRY_WINDOW_S
+            if not self._tracking_live():
+                return
+            try:
+                self.current_robot.start_head_tracking(weight=1.0)
+            except Exception as e:
+                logger.warning("Could not resume head tracking after holding at a limit: %s", e)
+            return
+        if not self._tracking_live() or self._body_turn_until is not None:
+            self._still_since = None
+            return
+        try:
+            face = self.current_robot.get_tracked_face(wait=False)
+            head_pose = self.current_robot.get_current_head_pose()
+        except Exception as e:
+            logger.warning("Cannot check the tracking limits, robot state unavailable: %s", e)
+            self._still_since = None
+            return
+        if not face.detected or face.x is None or face.y is None:
+            self._still_since = None
+            return
+        if max(abs(face.x), abs(face.y)) <= LIMIT_FACE_OFFSET:
+            self._still_since = None
+            self._limit_hold_s = LIMIT_HOLD_S  # the face is reachable again
+            return
+        if self._still_since is None or rotation_between(self._still_since[1], head_pose) > LIMIT_STILL_RAD:
+            self._still_since = (current_time, head_pose)
+            return
+        if current_time - self._still_since[0] < LIMIT_STILL_S:
+            return
+        if self._limit_retry_until is not None and current_time < self._limit_retry_until:
+            self._limit_hold_s = min(self._limit_hold_s * 2, LIMIT_HOLD_MAX_S)
+        try:
+            self.current_robot.start_head_tracking(weight=0.0)
+        except Exception as e:
+            logger.warning("Could not pause head tracking at a limit: %s", e)
+            self._still_since = None
+            return
+        self._limit_anchor = head_pose
+        self._limit_hold_until = current_time + self._limit_hold_s
+        self._still_since = None
+        logger.info(
+            "Face at (%.2f, %.2f) but the head stopped short; holding still for %.0fs",
+            face.x,
+            face.y,
+            self._limit_hold_s,
         )
 
     def _finish_turn(self, current_time: float) -> None:
@@ -610,6 +783,7 @@ class MovementManager:
         self._track_anchor = None
         self._turn_until = None
         self._is_speaking = False
+        self._reset_follow_state()
         if dozing:
             self.state.current_move = DozeMove(start_pose=head, start_antennas=antennas)
             self._breathing_active = False
@@ -732,21 +906,29 @@ class MovementManager:
             primary_full_body_pose = (neutral_head_pose, (0.0, 0.0), 0.0)
             self.state.last_primary_pose = clone_full_body_pose(primary_full_body_pose)
 
-        # Speaking pauses tracking: hold the look-at anchor, overlay emotions on it, dance from neutral.
-        if self._track_anchor is not None:
-            head_pose, antennas, body_yaw = primary_full_body_pose
-            move = self.state.current_move
-            if move is None:
-                head_pose = self._track_anchor.copy()
+        head_pose, antennas, body_yaw = primary_full_body_pose
+        move = self.state.current_move
+        # Speaking or a limit pauses tracking: hold the anchor (breathing too), overlay emotions, dance from neutral.
+        anchor = self._track_anchor if self._track_anchor is not None else self._limit_anchor
+        if anchor is not None:
+            if move is None or isinstance(move, BreathingMove):
+                head_pose = anchor.copy()
             elif isinstance(move, EmotionQueueMove):
-                head_pose = compose_world_offset(self._track_anchor, head_pose)
-            primary_full_body_pose = (head_pose, antennas, body_yaw)
-
-        return primary_full_body_pose
+                head_pose = compose_world_offset(anchor, head_pose)
+        # Only goto moves place the body; recorded choreography swings around wherever it is, idling holds it.
+        if isinstance(move, GotoQueueMove):
+            self._held_body_yaw = body_yaw
+        elif move is not None:
+            body_yaw += self._held_body_yaw
+        else:
+            body_yaw = self._held_body_yaw
+        return (head_pose, antennas, body_yaw)
 
     def _update_primary_motion(self, current_time: float) -> None:
         """Advance queue state and idle behaviours for this tick."""
         self._finish_turn(current_time)
+        self._follow_with_body(current_time)
+        self._guard_limits(current_time)
         self._manage_move_queue(current_time)
         self._manage_breathing(current_time)
 
@@ -947,6 +1129,7 @@ class MovementManager:
             "dozing": self._dozing,
             "head_tracking": self._head_tracking,
             "turning": self._turn_until is not None,
+            "at_limit": self._limit_hold_until is not None,
             "last_commanded_pose": {
                 "head": head_matrix,
                 "antennas": antennas,

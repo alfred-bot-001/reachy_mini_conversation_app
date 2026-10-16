@@ -230,12 +230,13 @@ class LocalStream:
             return None
 
     def _face_follow_status(self) -> dict[str, object]:
-        """Whether the head follows faces, whether it is mid-turn toward a voice, and the face it follows."""
+        """Whether the head follows faces, is mid-turn toward a voice or held at a limit, and the face it follows."""
         movement = self.handler.deps.movement_manager.get_status()
         tracked_face = self._tracked_face()
         return {
             "tracking": bool(movement.get("head_tracking")),
             "turning": bool(movement.get("turning")),
+            "at_limit": bool(movement.get("at_limit")),
             "face": None if tracked_face is None else {"x": tracked_face[0], "y": tracked_face[1]},
         }
 

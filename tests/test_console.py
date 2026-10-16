@@ -913,14 +913,14 @@ def test_camera_frame_carries_the_tracked_face_and_status_reports_face_follow(mo
     face = SimpleNamespace(detected=True, x=0.25, y=-0.1)
     robot = SimpleNamespace(media=media, get_tracked_face=lambda wait: face)
     handler = MagicMock()
-    handler.deps.movement_manager.get_status.return_value = {"head_tracking": True, "turning": False}
+    handler.deps.movement_manager.get_status.return_value = {"head_tracking": True, "turning": False, "at_limit": True}
     stream = LocalStream(handler, robot, settings_app=app)
     stream._init_settings_ui_if_needed()
     client = TestClient(app)
 
     assert client.get("/api/camera/frame.jpg").headers["x-tracked-face"] == "0.2500,-0.1000"
     status = _rpc_call(app, "conversation.status")["result"]["face_follow"]
-    assert status == {"tracking": True, "turning": False, "face": {"x": 0.25, "y": -0.1}}
+    assert status == {"tracking": True, "turning": False, "at_limit": True, "face": {"x": 0.25, "y": -0.1}}
 
     face.detected = False
     assert "x-tracked-face" not in client.get("/api/camera/frame.jpg").headers
