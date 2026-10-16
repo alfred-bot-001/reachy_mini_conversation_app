@@ -113,6 +113,30 @@ def test_mic_reports_and_toggles_mute_state_over_rpc() -> None:
     assert LocalStream(MagicMock(), robot)._mic_muted is False
 
 
+def test_doze_reports_and_toggles_over_rpc() -> None:
+    """conversation.doze reports doze and lets the home console doze off or wake Reachy up."""
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = MagicMock()
+    handler.is_dozing = False
+
+    async def fall_asleep() -> None:
+        handler.is_dozing = True
+
+    async def wake_up(reason: str) -> None:
+        handler.is_dozing = False
+        handler.woken_by = reason
+
+    handler.fall_asleep, handler.wake_up = fall_asleep, wake_up
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    assert _rpc_call(app, "conversation.doze")["result"] == {"dozing": False}
+    assert _rpc_call(app, "conversation.doze", {"dozing": True})["result"] == {"dozing": True}
+    assert _rpc_call(app, "conversation.doze", {"dozing": False})["result"] == {"dozing": False}
+    assert handler.woken_by == "console"
+
+
 def test_rest_api_is_removed_in_favor_of_rpc() -> None:
     """The /api/v1 REST + SSE surface is gone; control is JSON-RPC over /rpc."""
     app = FastAPI()
