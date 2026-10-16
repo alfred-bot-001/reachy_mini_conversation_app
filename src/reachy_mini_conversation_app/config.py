@@ -166,6 +166,39 @@ def resolve_doze_minutes() -> float | None:
     return minutes if minutes > 0 else None
 
 
+LOUD_WAKE_DBFS_ENV = "REACHY_MINI_LOUD_WAKE_DBFS"
+DEFAULT_LOUD_WAKE_DBFS = -30.0
+LOUD_WAKE_SECONDS_ENV = "REACHY_MINI_LOUD_WAKE_SECONDS"
+DEFAULT_LOUD_WAKE_SECONDS = 0.8
+DROWSY_MINUTES_ENV = "REACHY_MINI_DROWSY_MINUTES"
+DEFAULT_DROWSY_MINUTES = 2.0
+
+
+def _env_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using default.", name, raw_value)
+        return default
+
+
+def resolve_loud_wake() -> tuple[float, float] | None:
+    """Read the loud-sound wake settings: (threshold in dBFS, seconds of loud audio); None disables it."""
+    if os.getenv(LOUD_WAKE_DBFS_ENV, "").strip().lower() in {"off", "none", "0"}:
+        return None
+    return _env_float(LOUD_WAKE_DBFS_ENV, DEFAULT_LOUD_WAKE_DBFS), _env_float(
+        LOUD_WAKE_SECONDS_ENV, DEFAULT_LOUD_WAKE_SECONDS
+    )
+
+
+def resolve_drowsy_minutes() -> float:
+    """Read how long a lazily woken Reachy waits for someone to talk before dozing off again."""
+    return max(0.0, _env_float(DROWSY_MINUTES_ENV, DEFAULT_DROWSY_MINUTES))
+
+
 def resolve_wake_words() -> tuple[str, ...]:
     """Read the comma-separated wake words that end a doze."""
     raw_value = os.getenv(WAKE_WORDS_ENV, "").strip()
