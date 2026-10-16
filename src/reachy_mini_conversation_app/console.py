@@ -621,6 +621,21 @@ class LocalStream:
                 logger.info("Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted")
             return {"muted": self._mic_muted}
 
+        @rpc.method("conversation.doze")  # type: ignore[untyped-decorator]
+        async def _rpc_doze(params: dict[str, object]) -> dict[str, object]:
+            """Report doze, or doze off / wake up on request (the home console's 唤醒 / 休眠 buttons)."""
+            handler = self.handler
+            if "dozing" in params:
+                fall_asleep, wake_up = getattr(handler, "fall_asleep", None), getattr(handler, "wake_up", None)
+                if fall_asleep is None or wake_up is None:
+                    raise JsonRpcError("doze not supported by this backend", reason="unsupported")
+                if bool(params["dozing"]):
+                    await fall_asleep()
+                else:
+                    await wake_up("console")
+                logger.info("Doze %s via /rpc", "entered" if params["dozing"] else "left")
+            return {"dozing": bool(getattr(handler, "is_dozing", False))}
+
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:
             hf_selection = get_hf_connection_selection()
