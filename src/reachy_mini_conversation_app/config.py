@@ -146,6 +146,22 @@ def resolve_frame_clients() -> frozenset[str]:
     return frozenset(part.strip() for part in raw_value.split(",") if part.strip())
 
 
+FACE_FOLLOW_ENV = "REACHY_MINI_FACE_FOLLOW"
+DAEMON_URL_ENV = "REACHY_MINI_DAEMON_URL"
+DEFAULT_DAEMON_URL = "http://localhost:8000"
+
+
+def face_follow_enabled() -> bool:
+    """Return whether Reachy follows faces and turns toward whoever is speaking (on by default)."""
+    return _env_flag(FACE_FOLLOW_ENV, default=True)
+
+
+def resolve_daemon_doa_url() -> str:
+    """URL of the daemon's sound direction-of-arrival endpoint, polled while the user speaks."""
+    base_url = os.getenv(DAEMON_URL_ENV, "").strip() or DEFAULT_DAEMON_URL
+    return base_url.rstrip("/") + "/api/state/doa"
+
+
 def speech_wobble_enabled() -> bool:
     """Return whether the head should wobble with the assistant's voice (off by default)."""
     return _env_flag("REACHY_MINI_SPEECH_WOBBLE", default=False)

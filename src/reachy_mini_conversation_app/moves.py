@@ -11,6 +11,8 @@ Design overview
   folded) and rejects new moves until woken. A loud noise wakes it with a
   `LazyWakeMove` (slow rise, stretch, drowsy tilt, look left and right) instead
   of the plain rise to breathing.
+- With head tracking on, a voice from off to the side turns the head that way
+  (tracking paused for the turn) so the daemon's tracker re-acquires the speaker.
 
 Threading model
 - A dedicated worker thread owns all real-time state and issues `set_target`
@@ -28,11 +30,12 @@ Safety
 """
 
 from __future__ import annotations
+import math
 import time
 import logging
 import threading
 from queue import Empty, Queue
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Callable
 from collections import deque
 from dataclasses import dataclass
 
@@ -44,13 +47,22 @@ from reachy_mini.utils import create_head_pose
 from reachy_mini.motion.move import Move
 from reachy_mini.reachy_mini import SLEEP_HEAD_POSE, SLEEP_ANTENNAS_JOINT_POSITIONS
 from reachy_mini.utils.interpolation import compose_world_offset, linear_pose_interpolation
-from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+from reachy_mini_conversation_app.attention import wrap_angle
+from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove, EmotionQueueMove
 
 
 logger = logging.getLogger(__name__)
 
 # Configuration constants
 CONTROL_LOOP_FREQUENCY_HZ = 60.0  # Hz - Target frequency for the movement control loop
+
+# Turning toward a voice
+TURN_DURATION_S = 0.7
+TURN_COOLDOWN_S = 2.0
+MAX_HEAD_YAW_RAD = math.radians(60)
+MIN_TURN_RAD = math.radians(12)  # smaller offsets are left to the tracker
+SAME_SPEAKER_RAD = math.radians(25)  # DoA error band: a voice this close to the tracked face is that person
+CAMERA_HALF_WIDTH_TAN = 0.96  # tan(half horizontal FOV) of the Reachy Mini camera (fx 2002 px, 3840 px wide)
 
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
@@ -266,6 +278,9 @@ class MovementManager:
     - External threads communicate via `_command_queue` messages.
     """
 
+    # Told whenever listening toggles, so speaker attention samples DoA only while the user talks.
+    on_listening: Callable[[bool], None] | None = None
+
     def __init__(
         self,
         current_robot: ReachyMini,
@@ -304,6 +319,8 @@ class MovementManager:
         self._last_listening_blend_time = self._now()
         self._breathing_active = False  # true when breathing move is running or queued
         self._dozing = False  # true while holding the doze pose; new moves are rejected
+        self._turn_until: float | None = None  # end of a turn toward a voice; tracking resumes then
+        self._last_turn_time = -TURN_COOLDOWN_S
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
         self._last_set_target_err = 0.0
@@ -368,10 +385,19 @@ class MovementManager:
             if self._shared_is_listening == listening:
                 return
         self._command_queue.put(("set_listening", listening))
+        if self.on_listening is not None:
+            self.on_listening(listening)
 
     def set_head_tracking(self, enabled: bool) -> None:
         """Start or stop following the user's face; thread-safe via the command queue."""
         self._command_queue.put(("set_head_tracking", enabled))
+
+    def look_toward(self, yaw: float) -> None:
+        """Turn toward a voice ``yaw`` radians off the head (positive = left) unless the tracked face is there.
+
+        Thread-safe: posted to the worker command queue.
+        """
+        self._command_queue.put(("look_toward", float(yaw)))
 
     def set_dozing(self, dozing: bool) -> None:
         """Tuck into the doze pose and hold still, or wake back up to breathing.
@@ -472,6 +498,7 @@ class MovementManager:
                 return
             self._head_tracking = enabled
             self._track_anchor = None
+            self._turn_until = None
             # set_speaking is gated off while disabled, so its state would go stale across a toggle.
             self._is_speaking = False
             if self._dozing:
@@ -487,6 +514,8 @@ class MovementManager:
             self._set_dozing(bool(payload), current_time)
         elif command == "lazy_wake":
             self._set_dozing(False, current_time, lazy=True)
+        elif command == "look_toward":
+            self._look_toward(float(payload), current_time)
         elif command == "set_speaking":
             if not self._head_tracking or self._dozing:
                 return
@@ -507,6 +536,70 @@ class MovementManager:
         else:
             logger.warning("Unknown command received by MovementManager: %s", command)
 
+    def _look_toward(self, yaw: float, current_time: float) -> None:
+        """Turn toward a voice unless the tracked face is already there (worker thread only)."""
+        if not self._head_tracking or self._dozing or self._is_speaking or self._turn_until is not None:
+            return
+        if current_time - self._last_turn_time < TURN_COOLDOWN_S:
+            return
+        try:
+            face = self.current_robot.get_tracked_face(wait=False)
+            head_pose = self.current_robot.get_current_head_pose()
+        except Exception as e:
+            logger.warning("Cannot turn toward the voice, robot state unavailable: %s", e)
+            return
+        if face.detected and face.x is not None:
+            # Image x grows to the right, yaw to the left.
+            face_yaw = -math.atan(float(face.x) * CAMERA_HALF_WIDTH_TAN)
+            if abs(wrap_angle(yaw - face_yaw)) <= SAME_SPEAKER_RAD:
+                return
+        elif abs(yaw) < MIN_TURN_RAD:
+            return
+        current_yaw = math.atan2(head_pose[1, 0], head_pose[0, 0])
+        target_yaw = max(-MAX_HEAD_YAW_RAD, min(MAX_HEAD_YAW_RAD, current_yaw + yaw))
+        if abs(target_yaw - current_yaw) < MIN_TURN_RAD:
+            return
+        try:
+            # Weight 0 pauses detection but keeps the tracker's face association, so on resume it picks
+            # the face nearest where the last one was: the centre, where the speaker now is.
+            self.current_robot.start_head_tracking(weight=0.0)
+        except Exception as e:
+            logger.warning("Could not pause head tracking to turn toward the voice: %s", e)
+            return
+        antennas = self._last_commanded_pose[1]
+        self.move_queue.clear()
+        self.state.current_move = GotoQueueMove(
+            target_head_pose=create_head_pose(0, 0, 0, 0, 0, target_yaw, degrees=False),
+            start_head_pose=head_pose,
+            target_antennas=antennas,
+            start_antennas=antennas,
+            duration=TURN_DURATION_S,
+        )
+        self.state.move_start_time = current_time
+        self.state.update_activity()
+        self._breathing_active = False
+        self._track_anchor = None
+        self._turn_until = current_time + TURN_DURATION_S
+        self._last_turn_time = current_time
+        logger.info(
+            "Voice %.0f° off the head (tracked face: %s); turning to yaw %.0f°",
+            math.degrees(yaw),
+            "yes" if face.detected else "none",
+            math.degrees(target_yaw),
+        )
+
+    def _finish_turn(self, current_time: float) -> None:
+        """Hand the head back to the tracker once a turn toward a voice has played out."""
+        if self._turn_until is None or current_time < self._turn_until:
+            return
+        self._turn_until = None
+        if not self._head_tracking or self._dozing:
+            return
+        try:
+            self.current_robot.start_head_tracking(weight=1.0)
+        except Exception as e:
+            logger.warning("Could not resume head tracking after turning: %s", e)
+
     def _set_dozing(self, dozing: bool, current_time: float, lazy: bool = False) -> None:
         """Enter or leave the doze pose (worker thread only)."""
         if self._dozing == dozing:
@@ -515,6 +608,7 @@ class MovementManager:
         self._dozing = dozing
         self.move_queue.clear()
         self._track_anchor = None
+        self._turn_until = None
         self._is_speaking = False
         if dozing:
             self.state.current_move = DozeMove(start_pose=head, start_antennas=antennas)
@@ -652,6 +746,7 @@ class MovementManager:
 
     def _update_primary_motion(self, current_time: float) -> None:
         """Advance queue state and idle behaviours for this tick."""
+        self._finish_turn(current_time)
         self._manage_move_queue(current_time)
         self._manage_breathing(current_time)
 
@@ -850,6 +945,8 @@ class MovementManager:
             "is_listening": self._is_listening,
             "breathing_active": self._breathing_active,
             "dozing": self._dozing,
+            "head_tracking": self._head_tracking,
+            "turning": self._turn_until is not None,
             "last_commanded_pose": {
                 "head": head_matrix,
                 "antennas": antennas,

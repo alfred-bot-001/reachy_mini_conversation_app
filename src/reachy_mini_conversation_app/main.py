@@ -20,6 +20,7 @@ from reachy_mini_conversation_app.utils import (
     setup_logger,
     log_connection_troubleshooting,
 )
+from reachy_mini_conversation_app.attention import SpeakerAttention
 
 
 if TYPE_CHECKING:
@@ -89,8 +90,10 @@ def run(
     from reachy_mini_conversation_app.config import (
         HF_LOCAL_CONNECTION_MODE,
         set_instance_path,
+        face_follow_enabled,
         resolve_doze_minutes,
         speech_wobble_enabled,
+        resolve_daemon_doa_url,
         get_hf_connection_selection,
         resolve_app_timeout_minutes,
         refresh_runtime_config_from_env,
@@ -158,6 +161,10 @@ def run(
     app_lifecycle.wake_up_if_sleeping(robot, logger)
 
     movement_manager = MovementManager(current_robot=robot)
+    speaker_attention: SpeakerAttention | None = None
+    if face_follow_enabled():
+        speaker_attention = SpeakerAttention(movement_manager, resolve_daemon_doa_url())
+        movement_manager.on_listening = speaker_attention.set_user_speaking
 
     deps = ToolDependencies(
         reachy_mini=robot,
@@ -287,6 +294,10 @@ def run(
 
     # Each async service → its own thread/loop
     movement_manager.start()
+    if speaker_attention is not None:
+        speaker_attention.start()
+        movement_manager.set_head_tracking(True)
+        logger.info("Face follow mode: tracking faces and turning toward whoever speaks")
     # Audio-reactive head motion is driven by the daemon's wobbler, which
     # taps the media pipeline at push_audio_sample. The console stream pushes
     # assistant audio through that pipeline directly.
@@ -340,6 +351,8 @@ def run(
         # the shutdown came from the voice go_to_sleep tool the robot is
         # already in the sleep pose; on a plain stop it stays awake and
         # the daemon returns it to neutral once the process exits.
+        if speaker_attention is not None:
+            speaker_attention.stop()
         movement_manager.stop(reset_to_neutral=False)
         try:
             robot.disable_wobbling()

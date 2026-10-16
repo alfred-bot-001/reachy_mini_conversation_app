@@ -903,3 +903,25 @@ def test_camera_frame_is_served_only_to_allowlisted_clients(monkeypatch: pytest.
     assert _frame_client(monkeypatch, None, b"x").get("/api/camera/frame.jpg").status_code == 403
     assert _frame_client(monkeypatch, "none", b"x").get("/api/camera/frame.jpg").status_code == 403
     assert _frame_client(monkeypatch, "testclient", None).get("/api/camera/frame.jpg").status_code == 503
+
+
+def test_camera_frame_carries_the_tracked_face_and_status_reports_face_follow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The face watcher learns which face Reachy looks at; the status page shows the follow state."""
+    monkeypatch.setenv("REACHY_MINI_FRAME_CLIENTS", "testclient")
+    app = FastAPI()
+    media = SimpleNamespace(audio=None, backend=None, get_frame_jpeg=lambda: b"\xff\xd8jpeg")
+    face = SimpleNamespace(detected=True, x=0.25, y=-0.1)
+    robot = SimpleNamespace(media=media, get_tracked_face=lambda wait: face)
+    handler = MagicMock()
+    handler.deps.movement_manager.get_status.return_value = {"head_tracking": True, "turning": False}
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    client = TestClient(app)
+
+    assert client.get("/api/camera/frame.jpg").headers["x-tracked-face"] == "0.2500,-0.1000"
+    status = _rpc_call(app, "conversation.status")["result"]["face_follow"]
+    assert status == {"tracking": True, "turning": False, "face": {"x": 0.25, "y": -0.1}}
+
+    face.detected = False
+    assert "x-tracked-face" not in client.get("/api/camera/frame.jpg").headers
+    assert _rpc_call(app, "conversation.status")["result"]["face_follow"]["face"] is None
