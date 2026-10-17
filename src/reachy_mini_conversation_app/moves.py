@@ -22,7 +22,9 @@ Design overview
 - A lost face leaves the head where it is: before the daemon would recentre it on
   the world front (which twists the neck once the body is turned), tracking is
   re-armed and the pose held until a face shows up again. The same hold bridges
-  every hand-back to the tracker (after speaking, a turn or a limit hold).
+  every hand-back to the tracker (after speaking, a turn or a limit hold). Once
+  nobody has been seen or heard for a while, head and body ease back to the front
+  together; a face showing up stops that and tracking takes over.
 - Body yaw is held between moves: only goto moves set it, other moves offset it.
 
 Threading model
@@ -86,6 +88,14 @@ MAX_BODY_YAW_RAD = math.radians(150)  # the daemon stops the body at ±160°
 
 # Face lost: the daemon recentres the head on the world front 2 s after the last face; act before that.
 FACE_LOST_HOLD_S = 1.0
+# Nobody seen or heard for this long: ease head and body back to the front, together so the neck never twists.
+RECENTER_QUIET_S = 30.0
+RECENTER_DURATION_S = 4.0
+RECENTER_DONE_RAD = math.radians(3)
+# Commands that mean someone is interacting (speech either way, a voice direction, a requested move).
+INTERACTION_COMMANDS = frozenset(
+    {"queue_move", "set_moving_state", "mark_activity", "set_listening", "set_speaking", "look_toward"}
+)
 
 # Limit hold: the head is already well over to one side, the face sits further out that way, and nothing moves.
 # The daemon tracker settles with the face a little above centre, so an offset alone never counts as a limit.
@@ -378,6 +388,11 @@ class MovementManager:
         # Pose held while the tracker has no face, so the head stays put instead of recentring on the world front.
         self._watch_anchor: NDArray[np.float64] | None = None
         self._face_seen_at: float | None = None
+        # Quiet-time recentring: last face sighting, last interaction, and the recentre in progress.
+        self._last_face_at = self._now()
+        self._last_interaction = self._now()
+        self._recentred = False
+        self._recenter_until: float | None = None
         # Head pose held, and since when, while the tracked face sits off-centre: no motion means a limit.
         self._still_since: tuple[float, NDArray[np.float64]] | None = None
         self._limit_anchor: NDArray[np.float64] | None = None  # pose held while tracking is paused at a limit
@@ -493,6 +508,9 @@ class MovementManager:
 
     def _handle_command(self, command: str, payload: Any, current_time: float) -> None:
         """Handle a single cross-thread command."""
+        if command in INTERACTION_COMMANDS:
+            self._last_interaction = current_time
+            self._recentred = False
         if command == "queue_move":
             if self._dozing:
                 logger.debug("Dozing; ignored queued move %s", type(payload).__name__)
@@ -695,9 +713,18 @@ class MovementManager:
             return
         if face.detected:
             self._face_seen_at = current_time
+            self._last_face_at = current_time
+            self._recentred = False
             self._watch_anchor = None  # the tracker has the head again
+            if self._recenter_until is not None:
+                self._recenter_until = None
+                if isinstance(self.state.current_move, GotoQueueMove):
+                    self.state.current_move = None  # stop where we are; the tracker eases on from here
+                    self.state.move_start_time = None
+                logger.info("Face found while recentring; following it instead")
             return
         if self._face_seen_at is None or current_time - self._face_seen_at < FACE_LOST_HOLD_S:
+            self._recenter_when_quiet(current_time)
             return
         self._face_seen_at = None
         try:
@@ -711,6 +738,51 @@ class MovementManager:
             return
         self._watch_anchor = head_pose
         logger.info("Face lost for %.1fs; holding the head where it is", FACE_LOST_HOLD_S)
+
+    def _recenter_when_quiet(self, current_time: float) -> None:
+        """Ease head and body back to the front once nobody has been seen or heard for a while."""
+        if self._recenter_until is not None:
+            if current_time >= self._recenter_until:
+                self._recenter_until = None
+            return
+        if self._recentred:
+            return
+        quiet_for = current_time - max(self._last_face_at, self._last_interaction)
+        if quiet_for < RECENTER_QUIET_S:
+            return
+        move = self.state.current_move
+        if (move is not None and not isinstance(move, BreathingMove)) or self.move_queue or self._is_listening:
+            return
+        try:
+            head_pose = self.current_robot.get_current_head_pose()
+            body_yaw = self._present_body_yaw()
+        except Exception as e:
+            logger.warning("Cannot recentre, robot state unavailable: %s", e)
+            return
+        self._recentred = True
+        home = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+        if rotation_between(head_pose, home) < RECENTER_DONE_RAD and abs(body_yaw) < RECENTER_DONE_RAD:
+            return
+        antennas = self._last_commanded_pose[1]
+        self.state.current_move = GotoQueueMove(
+            target_head_pose=home,
+            start_head_pose=head_pose,
+            target_antennas=antennas,
+            start_antennas=antennas,
+            target_body_yaw=0.0,
+            start_body_yaw=body_yaw,
+            duration=RECENTER_DURATION_S,
+            ease=True,
+        )
+        self.state.move_start_time = current_time
+        self._breathing_active = False
+        self._watch_anchor = None  # breathing afterwards rests on the front, where the head now is
+        self._recenter_until = current_time + RECENTER_DURATION_S
+        logger.info(
+            "Nobody seen or heard for %.0fs; easing head and body back to the front (body from %.0f°)",
+            quiet_for,
+            math.degrees(body_yaw),
+        )
 
     def _follow_with_body(self, current_time: float) -> None:
         """Turn the body under the head once the neck has been held well round toward the tracked face."""

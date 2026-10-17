@@ -12,7 +12,9 @@ from reachy_mini_conversation_app.moves import (
     LIMIT_HOLD_S,
     TURN_DURATION_S,
     FACE_LOST_HOLD_S,
+    RECENTER_QUIET_S,
     BODY_FOLLOW_DELAY_S,
+    RECENTER_DURATION_S,
     BODY_FOLLOW_COOLDOWN_S,
     BODY_FOLLOW_DURATION_S,
     BODY_REVERSE_COOLDOWN_S,
@@ -551,3 +553,75 @@ def test_a_limit_hold_hands_back_without_dropping_the_pose() -> None:
     manager._guard_limits(now + 0.7 + LIMIT_HOLD_S)
     assert manager._limit_anchor is None
     assert np.allclose(manager._watch_anchor, held_pose)
+
+
+def _quiet_manager(face: _Face) -> tuple[MovementManager, MagicMock, float]:
+    """Body turned 50° left, head on it, face lost and held; returns the moment the last face was seen."""
+    manager, robot = _tracking_manager(face, head_yaw_deg=50, body_yaw_deg=50)
+    now = manager._now()
+    manager._watch_for_face(now)
+    face.detected = False
+    manager._watch_for_face(now + FACE_LOST_HOLD_S)
+    assert manager._watch_anchor is not None
+    return manager, robot, now
+
+
+def test_after_a_quiet_spell_head_and_body_ease_back_to_the_front_together() -> None:
+    """Hold first; once nobody has been seen or heard for a while, return slowly to the front, neck untwisted."""
+    face = _Face(detected=True, x=0.0)
+    manager, robot, seen_at = _quiet_manager(face)
+    manager._watch_for_face(seen_at + RECENTER_QUIET_S - 1.0)
+    assert manager.state.current_move is None  # still holding where the person was
+
+    # Someone talks (no face in view): the quiet spell starts over.
+    manager._handle_command("set_listening", True, seen_at + RECENTER_QUIET_S - 0.5)
+    manager._handle_command("set_listening", False, seen_at + RECENTER_QUIET_S)
+    manager._watch_for_face(seen_at + RECENTER_QUIET_S + 1.0)
+    assert manager.state.current_move is None
+
+    start = seen_at + 2 * RECENTER_QUIET_S + 0.1
+    manager._watch_for_face(start)
+    move = manager.state.current_move
+    assert isinstance(move, GotoQueueMove)
+    assert manager._watch_anchor is None
+    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+        head, _, body_yaw = move.evaluate(fraction * RECENTER_DURATION_S)
+        head_deg = float(np.degrees(np.arctan2(head[1, 0], head[0, 0])))
+        assert head_deg == pytest.approx(np.degrees(body_yaw), abs=1.0)  # the neck stays straight all the way
+    assert move.evaluate(0.1 * RECENTER_DURATION_S)[2] > np.radians(48)  # starts gently
+    assert move.evaluate(RECENTER_DURATION_S)[2] == pytest.approx(0.0)
+
+    # Once is enough: no new recentre while it stays quiet.
+    manager._watch_for_face(start + RECENTER_DURATION_S)
+    manager.state.current_move = None
+    manager._watch_for_face(start + RECENTER_DURATION_S + 60.0)
+    assert manager.state.current_move is None
+
+
+def test_a_face_showing_up_while_recentring_stops_it_and_tracking_takes_over() -> None:
+    """Someone walks up mid-recentre: stop where the head is and let the tracker ease on from there."""
+    face = _Face(detected=True, x=0.0)
+    manager, robot, seen_at = _quiet_manager(face)
+    start = seen_at + RECENTER_QUIET_S + 0.1
+    manager._watch_for_face(start)
+    assert isinstance(manager.state.current_move, GotoQueueMove)
+    face.detected = True
+    manager._watch_for_face(start + 1.0)
+    assert manager.state.current_move is None
+    assert manager._recenter_until is None
+
+
+def test_no_recentring_while_a_face_is_in_view_or_something_is_playing() -> None:
+    """A person sitting there quietly is still company; a move in progress is never cut short."""
+    face = _Face(detected=True, x=0.0)
+    manager, robot = _tracking_manager(face, head_yaw_deg=50, body_yaw_deg=50)
+    now = manager._now()
+    for seconds in (0.0, RECENTER_QUIET_S + 1.0, 2 * RECENTER_QUIET_S):
+        manager._watch_for_face(now + seconds)
+    assert manager.state.current_move is None  # someone is sitting there quietly: keep looking at them
+
+    manager, robot, seen_at = _quiet_manager(_Face(detected=True, x=0.0))
+    playing = _FakeMove(np.eye(4))
+    manager.state.current_move = playing
+    manager._watch_for_face(seen_at + RECENTER_QUIET_S + 1.0)
+    assert manager.state.current_move is playing
