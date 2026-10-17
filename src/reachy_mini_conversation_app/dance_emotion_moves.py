@@ -99,9 +99,11 @@ class GotoQueueMove(Move):  # type: ignore
         target_body_yaw: float = 0,
         start_body_yaw: float | None = None,
         duration: float = 1.0,
+        ease: bool = False,
     ):
-        """Initialize a GotoQueueMove."""
+        """Initialize a GotoQueueMove; ``ease`` starts and stops gently instead of at constant speed."""
         self._duration = duration
+        self.ease = ease
         self.target_head_pose = target_head_pose
         self.start_head_pose = start_head_pose
         self.target_antennas = target_antennas
@@ -122,6 +124,8 @@ class GotoQueueMove(Move):  # type: ignore
 
             # Clamp t to [0, 1] for interpolation
             t_clamped = max(0, min(1, t / self.duration))
+            if self.ease:
+                t_clamped = t_clamped * t_clamped * (3 - 2 * t_clamped)  # smoothstep: zero speed at both ends
 
             # Use start pose if available, otherwise neutral
             if self.start_head_pose is not None:

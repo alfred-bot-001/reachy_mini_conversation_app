@@ -10,7 +10,12 @@ from reachy_mini.utils import create_head_pose
 from reachy_mini.utils.interpolation import compose_world_offset
 from reachy_mini_conversation_app.moves import (
     LIMIT_HOLD_S,
+    TURN_DURATION_S,
+    FACE_LOST_HOLD_S,
+    BODY_FOLLOW_DELAY_S,
+    BODY_FOLLOW_COOLDOWN_S,
     BODY_FOLLOW_DURATION_S,
+    BODY_REVERSE_COOLDOWN_S,
     BreathingMove,
     MovementManager,
     LoopFrequencyStats,
@@ -263,9 +268,19 @@ def test_look_toward_turns_to_a_voice_away_from_the_tracked_face_then_resumes_tr
 
     manager._finish_turn(now + 0.1)
     assert manager.get_status()["turning"] is True
-    manager._finish_turn(now + 1.0)
+    manager._finish_turn(now + TURN_DURATION_S)
     assert manager.get_status()["turning"] is False
     robot.start_head_tracking.assert_called_with(weight=1.0)
+    # Until the tracker sees a face again the head stays where the turn ended, breathing or not.
+    assert manager._watch_anchor is not None
+
+
+def test_turns_ease_in_and_out() -> None:
+    """A voice turn starts and ends slowly instead of jerking off at full speed."""
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0))
+    manager._handle_command("look_toward", np.radians(40), manager._now())
+    assert _commanded_yaw_deg(manager, 0.1 * TURN_DURATION_S) < 4.0 * 0.5  # linear would already be at 4°
+    assert _commanded_yaw_deg(manager, 0.5 * TURN_DURATION_S) == pytest.approx(20.0, abs=0.5)
 
 
 def test_look_toward_ignores_a_voice_from_the_tracked_face() -> None:
@@ -277,20 +292,22 @@ def test_look_toward_ignores_a_voice_from_the_tracked_face() -> None:
     assert manager.state.current_move is None
 
 
-def test_look_toward_without_a_face_turns_only_for_clear_offsets_and_clamps_the_neck() -> None:
-    """No face locked: small offsets are left to the tracker; large ones turn as far as the neck allows."""
+def test_look_toward_without_a_face_stays_put_and_a_far_voice_turns_only_as_far_as_the_neck_allows() -> None:
+    """Nobody in view: voices (TV, echoes, talk elsewhere) never swing the head. With a face, the neck is clamped."""
     manager, robot = _tracking_manager(_Face(detected=False))
-    manager._handle_command("look_toward", np.radians(8), manager._now())
+    for degrees in (8, 40, -100):
+        manager._handle_command("look_toward", np.radians(degrees), manager._now())
     robot.start_head_tracking.assert_not_called()
+    assert manager.state.current_move is None
 
-    manager, robot = _tracking_manager(_Face(detected=False), head_yaw_deg=30)
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0), head_yaw_deg=30)
     manager._handle_command("look_toward", np.radians(-100), manager._now())
     assert _commanded_yaw_deg(manager, 10.0) == pytest.approx(-60.0, abs=0.5)
 
 
 def test_look_toward_is_blocked_while_speaking_dozing_untracked_or_cooling_down() -> None:
     """Reachy keeps still while it talks or dozes, never turns with tracking off, and not twice in a row."""
-    manager, robot = _tracking_manager(_Face(detected=False))
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0))
     yaw = np.radians(45)
     now = manager._now()
 
@@ -307,23 +324,23 @@ def test_look_toward_is_blocked_while_speaking_dozing_untracked_or_cooling_down(
     manager._head_tracking = True
     manager._handle_command("look_toward", yaw, now)
     robot.start_head_tracking.assert_called_once_with(weight=0.0)
-    manager._finish_turn(now + 1.0)
-    manager._handle_command("look_toward", yaw, now + 1.0)
+    manager._finish_turn(now + TURN_DURATION_S)
+    manager._handle_command("look_toward", yaw, now + TURN_DURATION_S)
     assert manager.get_status()["turning"] is False  # within the cooldown
-    manager._handle_command("look_toward", yaw, now + 3.0)
+    manager._handle_command("look_toward", yaw, now + 3.5)
     assert manager.get_status()["turning"] is True
 
 
 def test_look_toward_clamps_the_neck_relative_to_the_body_and_keeps_the_body_still() -> None:
     """With the body already turned 40° left, a voice far left takes the head to body + 60°, body untouched."""
-    manager, robot = _tracking_manager(_Face(detected=False), head_yaw_deg=40, body_yaw_deg=40)
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0), head_yaw_deg=40, body_yaw_deg=40)
     manager._handle_command("look_toward", np.radians(100), manager._now())
     assert _commanded_yaw_deg(manager, 10.0) == pytest.approx(100.0, abs=0.5)
     assert manager.state.current_move.evaluate(10.0)[2] == pytest.approx(np.radians(40))
 
 
 def test_a_neck_held_round_turns_the_body_under_the_head_and_idling_keeps_it_there() -> None:
-    """Looking 50° over the shoulder for half a second swings the body there; breathing doesn't undo it."""
+    """Looking 50° over the shoulder for two seconds swings the body there; breathing doesn't undo it."""
     manager, robot = _tracking_manager(_Face(detected=True, x=0.0), head_yaw_deg=20)
     now = manager._now()
     manager._follow_with_body(now)
@@ -332,9 +349,9 @@ def test_a_neck_held_round_turns_the_body_under_the_head_and_idling_keeps_it_the
 
     manager, robot = _tracking_manager(_Face(detected=True, x=0.0), head_yaw_deg=50)
     manager._follow_with_body(now)
-    manager._follow_with_body(now + 0.3)
+    manager._follow_with_body(now + 1.0)
     assert manager.state.current_move is None
-    manager._follow_with_body(now + 0.6)
+    manager._follow_with_body(now + BODY_FOLLOW_DELAY_S + 0.1)
     move = manager.state.current_move
     assert isinstance(move, GotoQueueMove)
     head, _, body_yaw = move.evaluate(BODY_FOLLOW_DURATION_S)
@@ -343,6 +360,7 @@ def test_a_neck_held_round_turns_the_body_under_the_head_and_idling_keeps_it_the
 
     manager.state.move_start_time = now + 0.6
     manager._get_primary_pose(now + 0.6 + BODY_FOLLOW_DURATION_S)
+    assert move.evaluate(0.1 * BODY_FOLLOW_DURATION_S)[2] < np.radians(5)  # eases off, no jerk
     manager.state.current_move = BreathingMove(np.eye(4), (0.0, 0.0))
     assert manager._get_primary_pose(now + 5.0)[2] == pytest.approx(np.radians(50))
     manager.state.current_move = None
@@ -419,9 +437,10 @@ def test_a_neck_at_its_limit_with_the_face_further_round_is_a_limit_too() -> Non
 
 def test_dozing_cancels_a_turn_and_listening_notifies_attention() -> None:
     """Dozing mid-turn must not resume tracking afterwards; listening toggles reach speaker attention."""
-    manager, robot = _tracking_manager(_Face(detected=False))
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0))
     now = manager._now()
     manager._handle_command("look_toward", np.radians(45), now)
+    assert manager.get_status()["turning"] is True
     manager._handle_command("set_dozing", True, now)
     robot.start_head_tracking.reset_mock()
     manager._finish_turn(now + 1.0)
@@ -431,3 +450,104 @@ def test_dozing_cancels_a_turn_and_listening_notifies_attention() -> None:
     manager.on_listening = heard.append
     manager.set_listening(True)
     assert heard == [True]
+
+
+def _hold_neck(manager: MovementManager, start: float, seconds: float) -> None:
+    for step in range(int(seconds * 10) + 1):
+        manager._follow_with_body(start + step * 0.1)
+
+
+def test_the_body_follows_only_a_settled_centred_face() -> None:
+    """A twisted neck still swinging toward the face (face off-centre) or a face flicker never turns the body."""
+    face = _Face(detected=True, x=0.5)
+    manager, robot = _tracking_manager(face, head_yaw_deg=50)
+    now = manager._now()
+    _hold_neck(manager, now, 3.0)
+    assert manager.state.current_move is None
+
+    # Centred, but the face drops out halfway through the wait: the wait starts over.
+    face.x = 0.0
+    manager._follow_with_body(now + 10.0)
+    manager._follow_with_body(now + 11.0)
+    face.detected = False
+    manager._follow_with_body(now + 11.5)
+    face.detected = True
+    manager._follow_with_body(now + 12.1)
+    assert manager.state.current_move is None
+    manager._follow_with_body(now + 12.1 + BODY_FOLLOW_DELAY_S)
+    assert isinstance(manager.state.current_move, GotoQueueMove)
+
+
+def test_the_body_rests_after_a_turn_and_never_swings_straight_back() -> None:
+    """The overnight ping-pong: body to -60°, head back to the world front, body back to 0 three seconds later."""
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0), head_yaw_deg=-60)
+    now = manager._now()
+    _hold_neck(manager, now, BODY_FOLLOW_DELAY_S + 0.1)
+    assert manager.state.current_move.evaluate(BODY_FOLLOW_DURATION_S)[2] == pytest.approx(np.radians(-60))
+    turned_at = now + BODY_FOLLOW_DELAY_S
+    manager.state.current_move = None
+    manager._body_turn_until = None
+
+    # Same way again, but still resting.
+    robot.get_current_joint_positions.return_value = ([np.radians(-60)] + [0.0] * 6, [0.0, 0.0])
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, -105, degrees=True)
+    _hold_neck(manager, turned_at + 1.0, BODY_FOLLOW_COOLDOWN_S - 2.0)
+    assert manager.state.current_move is None
+
+    # The other way: not for half a minute.
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, -5, degrees=True)
+    _hold_neck(manager, turned_at + BODY_FOLLOW_COOLDOWN_S, BODY_REVERSE_COOLDOWN_S - BODY_FOLLOW_COOLDOWN_S - 1.0)
+    assert manager.state.current_move is None
+    _hold_neck(manager, turned_at + BODY_REVERSE_COOLDOWN_S, BODY_FOLLOW_DELAY_S + 0.2)
+    assert manager.state.current_move.evaluate(BODY_FOLLOW_DURATION_S)[2] == pytest.approx(np.radians(-5))
+
+
+def test_a_lost_face_leaves_the_head_where_it_is_until_a_face_comes_back() -> None:
+    """Before the daemon would recentre on the world front, re-arm tracking and hold the current pose."""
+    face = _Face(detected=True, x=0.0)
+    manager, robot = _tracking_manager(face, head_yaw_deg=50, body_yaw_deg=50)
+    now = manager._now()
+    manager._watch_for_face(now)
+    face.detected = False
+    manager._watch_for_face(now + 0.5)
+    robot.start_head_tracking.assert_not_called()  # a short gap: the daemon holds its last target itself
+
+    manager._watch_for_face(now + FACE_LOST_HOLD_S)
+    assert robot.start_head_tracking.call_args_list == [call(weight=0.0), call(weight=1.0)]
+    held = robot.get_current_head_pose.return_value
+    manager.state.current_move = BreathingMove(np.eye(4), (0.0, 0.0))
+    manager.state.move_start_time = now
+    assert np.allclose(manager._get_primary_pose(now + 5.0)[0], held)
+
+    # Nobody for ages: no further re-arming, the pose just holds.
+    manager._watch_for_face(now + 10.0)
+    assert robot.start_head_tracking.call_count == 2
+
+    face.detected = True
+    manager._watch_for_face(now + 11.0)
+    assert manager._watch_anchor is None
+
+
+def test_speech_end_holds_the_head_until_the_tracker_has_the_face_again() -> None:
+    """Handing back after speaking must not drop the head to the breathing pose for a frame or two."""
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0), head_yaw_deg=30)
+    now = manager._now()
+    manager._handle_command("set_speaking", True, now)
+    anchor = manager._track_anchor
+    manager._handle_command("set_speaking", False, now + 2.0)
+    assert manager._track_anchor is None
+    assert manager._watch_anchor is anchor
+    robot.start_head_tracking.assert_called_with(weight=1.0)
+
+
+def test_a_limit_hold_hands_back_without_dropping_the_pose() -> None:
+    """When a limit hold ends, the held pose stays until the tracker sees the face again."""
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0, y=0.7))
+    held_pose = create_head_pose(0, 0, 0, 0, 30, 0, degrees=True)
+    robot.get_current_head_pose.return_value = held_pose
+    now = manager._now()
+    manager._guard_limits(now)
+    manager._guard_limits(now + 0.7)
+    manager._guard_limits(now + 0.7 + LIMIT_HOLD_S)
+    assert manager._limit_anchor is None
+    assert np.allclose(manager._watch_anchor, held_pose)

@@ -11,11 +11,18 @@ Design overview
   folded) and rejects new moves until woken. A loud noise wakes it with a
   `LazyWakeMove` (slow rise, stretch, drowsy tilt, look left and right) instead
   of the plain rise to breathing.
-- With head tracking on, a voice from off to the side turns the head that way
-  (tracking paused for the turn) so the daemon's tracker re-acquires the speaker.
+- With head tracking on and a face in view, a voice from off to the side turns the
+  head that way (tracking paused for the turn) so the daemon's tracker re-acquires
+  the speaker. With no face in view, voices are ignored.
 - Face following knows its limits: a neck held well round turns the body under the
   head, and when the head stops short of the face (a joint limit) tracking pauses
-  and the pose is held instead of straining, with a retry a little later.
+  and the pose is held instead of straining, with a retry a little later. The body
+  follows only a settled, centred face, rests between turns and never swings
+  straight back the other way.
+- A lost face leaves the head where it is: before the daemon would recentre it on
+  the world front (which twists the neck once the body is turned), tracking is
+  re-armed and the pose held until a face shows up again. The same hold bridges
+  every hand-back to the tracker (after speaking, a turn or a limit hold).
 - Body yaw is held between moves: only goto moves set it, other moves offset it.
 
 Threading model
@@ -61,18 +68,24 @@ logger = logging.getLogger(__name__)
 CONTROL_LOOP_FREQUENCY_HZ = 60.0  # Hz - Target frequency for the movement control loop
 
 # Turning toward a voice
-TURN_DURATION_S = 0.7
-TURN_COOLDOWN_S = 2.0
+TURN_DURATION_S = 1.5
+TURN_COOLDOWN_S = 3.0
 MAX_HEAD_YAW_RAD = math.radians(60)
 MIN_TURN_RAD = math.radians(12)  # smaller offsets are left to the tracker
 SAME_SPEAKER_RAD = math.radians(25)  # DoA error band: a voice this close to the tracked face is that person
 CAMERA_HALF_WIDTH_TAN = 0.96  # tan(half horizontal FOV) of the Reachy Mini camera (fx 2002 px, 3840 px wide)
 
-# Following with the body: a neck held this far round for a moment turns the body under the head
+# Following with the body: a neck held this far round, on a centred face, for a while turns the body under the head
 BODY_FOLLOW_YAW_RAD = math.radians(40)
-BODY_FOLLOW_DELAY_S = 0.5
-BODY_FOLLOW_DURATION_S = 1.0
+BODY_FOLLOW_DELAY_S = 2.0
+BODY_FOLLOW_DURATION_S = 2.5
+BODY_FOLLOW_FACE_OFFSET = 0.25  # the head must actually be on the face (normalised image x), not swinging to it
+BODY_FOLLOW_COOLDOWN_S = 10.0  # rest after a body turn
+BODY_REVERSE_COOLDOWN_S = 30.0  # no turning straight back the other way
 MAX_BODY_YAW_RAD = math.radians(150)  # the daemon stops the body at ±160°
+
+# Face lost: the daemon recentres the head on the world front 2 s after the last face; act before that.
+FACE_LOST_HOLD_S = 1.0
 
 # Limit hold: the head is already well over to one side, the face sits further out that way, and nothing moves.
 # The daemon tracker settles with the face a little above centre, so an offset alone never counts as a limit.
@@ -361,6 +374,10 @@ class MovementManager:
         self._held_body_yaw = 0.0  # body yaw between goto moves, so breathing doesn't undo a body turn
         self._body_turn_until: float | None = None
         self._neck_twisted_since: float | None = None
+        self._last_body_turn: tuple[float, float] | None = None  # (time, direction sign) of the last body turn
+        # Pose held while the tracker has no face, so the head stays put instead of recentring on the world front.
+        self._watch_anchor: NDArray[np.float64] | None = None
+        self._face_seen_at: float | None = None
         # Head pose held, and since when, while the tracked face sits off-centre: no motion means a limit.
         self._still_since: tuple[float, NDArray[np.float64]] | None = None
         self._limit_anchor: NDArray[np.float64] | None = None  # pose held while tracking is paused at a limit
@@ -576,8 +593,11 @@ class MovementManager:
                     self._track_anchor = self.current_robot.get_current_head_pose()
                     self.current_robot.start_head_tracking(weight=0.0)
                 elif not speaking:
+                    anchor = self._track_anchor
                     self._track_anchor = None
                     self._reset_follow_state()
+                    # The daemon applies tracking only from its next face sighting; hold still until then.
+                    self._watch_anchor = anchor
                     self.current_robot.start_head_tracking(weight=1.0)
             except Exception as e:
                 logger.warning("Head-tracking speaking handoff failed: %s", e)
@@ -585,7 +605,7 @@ class MovementManager:
             logger.warning("Unknown command received by MovementManager: %s", command)
 
     def _look_toward(self, yaw: float, current_time: float) -> None:
-        """Turn toward a voice unless the tracked face is already there (worker thread only)."""
+        """Turn toward a voice away from the tracked face; with no face in view, stay put (worker thread only)."""
         if not self._head_tracking or self._dozing or self._is_speaking or self._turn_until is not None:
             return
         if current_time - self._last_turn_time < TURN_COOLDOWN_S:
@@ -597,12 +617,11 @@ class MovementManager:
         except Exception as e:
             logger.warning("Cannot turn toward the voice, robot state unavailable: %s", e)
             return
-        if face.detected and face.x is not None:
-            # Image x grows to the right, yaw to the left.
-            face_yaw = -math.atan(float(face.x) * CAMERA_HALF_WIDTH_TAN)
-            if abs(wrap_angle(yaw - face_yaw)) <= SAME_SPEAKER_RAD:
-                return
-        elif abs(yaw) < MIN_TURN_RAD:
+        if not face.detected or face.x is None:
+            return  # sound with nobody in view is mostly TV, echoes or talk elsewhere; don't swing round for it
+        # Image x grows to the right, yaw to the left.
+        face_yaw = -math.atan(float(face.x) * CAMERA_HALF_WIDTH_TAN)
+        if abs(wrap_angle(yaw - face_yaw)) <= SAME_SPEAKER_RAD:
             return
         neck_yaw = wrap_angle(head_yaw(head_pose) - body_yaw)
         target_neck_yaw = max(-MAX_HEAD_YAW_RAD, min(MAX_HEAD_YAW_RAD, neck_yaw + yaw))
@@ -627,6 +646,7 @@ class MovementManager:
             target_body_yaw=body_yaw,
             start_body_yaw=body_yaw,
             duration=TURN_DURATION_S,
+            ease=True,
         )
         self.state.move_start_time = current_time
         self.state.update_activity()
@@ -635,9 +655,8 @@ class MovementManager:
         self._turn_until = current_time + TURN_DURATION_S
         self._last_turn_time = current_time
         logger.info(
-            "Voice %.0f° off the head (tracked face: %s); turning to yaw %.0f°",
+            "Voice %.0f° off the head, away from the tracked face; turning to yaw %.0f°",
             math.degrees(yaw),
-            "yes" if face.detected else "none",
             math.degrees(target_yaw),
         )
 
@@ -661,6 +680,37 @@ class MovementManager:
         self._still_since = None
         self._limit_anchor = None
         self._limit_hold_until = None
+        self._watch_anchor = None
+        self._face_seen_at = None
+
+    def _watch_for_face(self, current_time: float) -> None:
+        """Hold the head where it is while the tracker has no face, instead of letting it recentre."""
+        if not self._tracking_live():
+            self._face_seen_at = None
+            return
+        try:
+            face = self.current_robot.get_tracked_face(wait=False)
+        except Exception as e:
+            logger.warning("Cannot check for a tracked face, robot state unavailable: %s", e)
+            return
+        if face.detected:
+            self._face_seen_at = current_time
+            self._watch_anchor = None  # the tracker has the head again
+            return
+        if self._face_seen_at is None or current_time - self._face_seen_at < FACE_LOST_HOLD_S:
+            return
+        self._face_seen_at = None
+        try:
+            head_pose = self.current_robot.get_current_head_pose()
+            # Re-arming clears the daemon's last sighting, so its 2 s recentre never fires; until the next
+            # sighting it applies no tracking at all and the head holds the pose commanded here.
+            self.current_robot.start_head_tracking(weight=0.0)
+            self.current_robot.start_head_tracking(weight=1.0)
+        except Exception as e:
+            logger.warning("Could not hold the head after losing the face: %s", e)
+            return
+        self._watch_anchor = head_pose
+        logger.info("Face lost for %.1fs; holding the head where it is", FACE_LOST_HOLD_S)
 
     def _follow_with_body(self, current_time: float) -> None:
         """Turn the body under the head once the neck has been held well round toward the tracked face."""
@@ -679,9 +729,17 @@ class MovementManager:
             logger.warning("Cannot follow with the body, robot state unavailable: %s", e)
             return
         neck_yaw = wrap_angle(head_yaw(head_pose) - body_yaw)
-        if not face.detected or abs(neck_yaw) < BODY_FOLLOW_YAW_RAD:
+        # Every tick of the wait needs the head round and settled on the face: a flicker or a swing resets it.
+        on_face = face.detected and face.x is not None and abs(face.x) <= BODY_FOLLOW_FACE_OFFSET
+        if not on_face or abs(neck_yaw) < BODY_FOLLOW_YAW_RAD:
             self._neck_twisted_since = None
             return
+        if self._last_body_turn is not None:
+            turned_at, direction = self._last_body_turn
+            if current_time - turned_at < BODY_FOLLOW_COOLDOWN_S:
+                return
+            if direction * neck_yaw < 0 and current_time - turned_at < BODY_REVERSE_COOLDOWN_S:
+                return
         if self._neck_twisted_since is None:
             self._neck_twisted_since = current_time
             return
@@ -702,11 +760,13 @@ class MovementManager:
             target_body_yaw=target_body_yaw,
             start_body_yaw=body_yaw,
             duration=BODY_FOLLOW_DURATION_S,
+            ease=True,
         )
         self.state.move_start_time = current_time
         self.state.update_activity()
         self._breathing_active = False
         self._body_turn_until = current_time + BODY_FOLLOW_DURATION_S
+        self._last_body_turn = (current_time, math.copysign(1.0, target_body_yaw - body_yaw))
         logger.info(
             "Neck %.0f° round for %.1fs; turning the body to %.0f°",
             math.degrees(neck_yaw),
@@ -720,9 +780,11 @@ class MovementManager:
             if current_time < self._limit_hold_until:
                 return
             self._limit_hold_until = None
+            self._watch_anchor = self._limit_anchor  # held until the tracker sees the face again
             self._limit_anchor = None
             self._limit_retry_until = current_time + LIMIT_RETRY_WINDOW_S
             if not self._tracking_live():
+                self._watch_anchor = None
                 return
             try:
                 self.current_robot.start_head_tracking(weight=1.0)
@@ -784,6 +846,8 @@ class MovementManager:
         self._turn_until = None
         if not self._head_tracking or self._dozing:
             return
+        # Look where the turn ended until the tracker finds a face there (breathing would drift back to centre).
+        self._watch_anchor = self._last_commanded_pose[0].astype(np.float64)
         try:
             self.current_robot.start_head_tracking(weight=1.0)
         except Exception as e:
@@ -924,8 +988,8 @@ class MovementManager:
 
         head_pose, antennas, body_yaw = primary_full_body_pose
         move = self.state.current_move
-        # Speaking or a limit pauses tracking: hold the anchor (breathing too), overlay emotions, dance from neutral.
-        anchor = self._track_anchor if self._track_anchor is not None else self._limit_anchor
+        # Speaking, a limit or a lost face: hold the anchor (breathing too), overlay emotions, dance from neutral.
+        anchor = next((a for a in (self._track_anchor, self._limit_anchor, self._watch_anchor) if a is not None), None)
         if anchor is not None:
             if move is None or isinstance(move, BreathingMove):
                 head_pose = anchor.copy()
@@ -943,6 +1007,7 @@ class MovementManager:
     def _update_primary_motion(self, current_time: float) -> None:
         """Advance queue state and idle behaviours for this tick."""
         self._finish_turn(current_time)
+        self._watch_for_face(current_time)
         self._follow_with_body(current_time)
         self._guard_limits(current_time)
         self._manage_move_queue(current_time)
