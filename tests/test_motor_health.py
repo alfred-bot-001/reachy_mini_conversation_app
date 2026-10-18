@@ -2,12 +2,17 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
+from reachy_mini.utils import create_head_pose
+from reachy_mini_conversation_app import motor_health
 from reachy_mini_conversation_app.motor_health import (
     HOT_C,
     COOL_C,
     CRITICAL_C,
+    IDLE_RETRY_S,
+    MAX_UNSAMPLED_S,
     OVERHEATING_ERROR,
     MotorReading,
     MotorHealthMonitor,
@@ -44,6 +49,8 @@ class _FakeBus:
 
 def _monitor(tmp_path: Path) -> tuple[MotorHealthMonitor, _FakeBus, MagicMock, MagicMock]:
     bus, robot, movement_manager = _FakeBus(), MagicMock(), MagicMock()
+    robot.get_current_head_pose.return_value = np.eye(4)
+    robot.get_current_joint_positions.return_value = ([0.0] * 7, [0.0, 0.0])
     movement_manager.get_status.return_value = {"dozing": False, "head_tracking": True}
     return MotorHealthMonitor(bus, robot, movement_manager, tmp_path), bus, robot, movement_manager
 
@@ -60,11 +67,13 @@ def test_read_packet_matches_the_protocol_2_reference_example() -> None:
 def test_parse_status_returns_the_error_byte_and_data_and_rejects_bad_packets() -> None:
     """A status packet yields its error byte and data; truncated or corrupted ones are rejected."""
     status = bytes.fromhex("FFFFFD000107005580A600000ECD")
-    assert parse_status(status, 3) == (0x80, bytes.fromhex("A60000"))
+    assert parse_status(status, 1, 3) == (0x80, bytes.fromhex("A60000"))
     with pytest.raises(ValueError):
-        parse_status(status[:8], 3)
+        parse_status(status[:8], 1, 3)
     with pytest.raises(ValueError):
-        parse_status(status[:-1] + b"\x00", 3)
+        parse_status(status[:-1] + b"\x00", 1, 3)
+    with pytest.raises(ValueError, match="motor 1"):
+        parse_status(status, 2, 3)  # a reply meant for another request must not be filed under this motor
 
 
 def test_each_sample_is_logged_with_the_motion_state(tmp_path: Path) -> None:
@@ -85,6 +94,28 @@ def test_no_bus_reads_while_the_daemon_plays_a_move(tmp_path: Path) -> None:
     bus.moving = True
     monitor.poll_once()
     assert bus.reads == 0
+
+
+def test_no_bus_reads_while_the_head_moves_unless_it_has_gone_too_long(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reads only happen with the head still, so they can't stutter a motion; a long busy spell still gets one."""
+    clock = [1000.0]
+    monkeypatch.setattr(motor_health.time, "monotonic", lambda: clock[0])
+    monitor, bus, robot, _ = _monitor(tmp_path)
+    monitor.poll_once()
+    assert bus.reads == 1
+
+    for step in range(1, 4):
+        robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, 10 * step, degrees=True)
+        clock[0] += IDLE_RETRY_S
+        assert monitor.poll_once() == IDLE_RETRY_S
+    assert bus.reads == 1
+
+    clock[0] += MAX_UNSAMPLED_S
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, 80, degrees=True)
+    monitor.poll_once()
+    assert bus.reads == 2
 
 
 def test_hot_motors_hold_the_doze_pose_until_every_motor_has_cooled(tmp_path: Path) -> None:

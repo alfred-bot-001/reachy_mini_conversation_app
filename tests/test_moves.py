@@ -10,11 +10,15 @@ from reachy_mini.utils import create_head_pose
 from reachy_mini.utils.interpolation import compose_world_offset
 from reachy_mini_conversation_app.moves import (
     LIMIT_HOLD_S,
+    TURN_COOLDOWN_S,
     TURN_DURATION_S,
     FACE_LOST_HOLD_S,
     RECENTER_QUIET_S,
+    QUIET_DIRECTION_S,
+    VOICE_FACE_WAIT_S,
     BODY_FOLLOW_DELAY_S,
     RECENTER_DURATION_S,
+    TURN_MAX_DURATION_S,
     BODY_FOLLOW_COOLDOWN_S,
     BODY_FOLLOW_DURATION_S,
     BODY_REVERSE_COOLDOWN_S,
@@ -283,6 +287,65 @@ def test_turns_ease_in_and_out() -> None:
     manager._handle_command("look_toward", np.radians(40), manager._now())
     assert _commanded_yaw_deg(manager, 0.1 * TURN_DURATION_S) < 4.0 * 0.5  # linear would already be at 4°
     assert _commanded_yaw_deg(manager, 0.5 * TURN_DURATION_S) == pytest.approx(20.0, abs=0.5)
+
+
+def test_big_voice_turns_take_longer_than_small_ones() -> None:
+    """Turn time grows with the angle, so a swing across the room is never a snap."""
+    manager, _ = _tracking_manager(_Face(detected=True, x=0.0))
+    now = manager._now()
+    manager._handle_command("look_toward", np.radians(40), now)
+    assert manager._turn_until - now == pytest.approx(TURN_DURATION_S)
+
+    manager, _ = _tracking_manager(_Face(detected=True, x=0.0))
+    manager._handle_command("look_toward", np.radians(60), now)
+    assert manager._turn_until - now == pytest.approx(2.0)
+
+    manager, _ = _tracking_manager(_Face(detected=True, x=0.0), head_yaw_deg=-50)
+    manager._handle_command("look_toward", np.radians(100), now)
+    assert manager._turn_until - now == pytest.approx(TURN_MAX_DURATION_S)
+    assert _commanded_yaw_deg(manager, TURN_MAX_DURATION_S) == pytest.approx(50.0, abs=0.5)
+
+
+def _turn_and_settle(
+    manager: MovementManager, robot: MagicMock, yaw_deg: float, start: float, face_after: _Face
+) -> float:
+    """Turn toward a voice, then report what the tracker sees there; return when the check is over."""
+    manager._handle_command("look_toward", np.radians(yaw_deg), start)
+    end = manager._turn_until
+    manager._finish_turn(end)
+    robot.get_tracked_face.return_value = face_after
+    manager._check_voice_turn(end + 0.5)
+    manager._check_voice_turn(end + VOICE_FACE_WAIT_S)
+    return end + VOICE_FACE_WAIT_S
+
+
+def test_a_voice_turn_that_finds_nobody_stops_voices_from_that_way_turning_the_head() -> None:
+    """A TV: once a turn toward it finds no face, its voice is ignored for a while; other directions still turn."""
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0))
+    now = _turn_and_settle(manager, robot, 40, manager._now(), _Face(detected=False))
+
+    robot.get_tracked_face.return_value = _Face(detected=True, x=0.0)
+    later = now + TURN_COOLDOWN_S
+    manager._handle_command("look_toward", np.radians(50), later)
+    assert manager.get_status()["turning"] is False
+
+    manager._handle_command("look_toward", np.radians(-40), later)
+    assert manager.get_status()["turning"] is True
+
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0))
+    now = _turn_and_settle(manager, robot, 40, manager._now(), _Face(detected=False))
+    robot.get_tracked_face.return_value = _Face(detected=True, x=0.0)
+    manager._handle_command("look_toward", np.radians(40), now + QUIET_DIRECTION_S)
+    assert manager.get_status()["turning"] is True
+
+
+def test_a_voice_turn_that_finds_a_face_keeps_turning_that_way() -> None:
+    """A turn that finds someone leaves that direction open to later voices."""
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0))
+    now = _turn_and_settle(manager, robot, 40, manager._now(), _Face(detected=True, x=0.1))
+    now = _turn_and_settle(manager, robot, -40, now + TURN_COOLDOWN_S, _Face(detected=True, x=0.1))
+    manager._handle_command("look_toward", np.radians(40), now + TURN_COOLDOWN_S)
+    assert manager.get_status()["turning"] is True
 
 
 def test_look_toward_ignores_a_voice_from_the_tracked_face() -> None:

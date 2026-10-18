@@ -70,8 +70,14 @@ logger = logging.getLogger(__name__)
 CONTROL_LOOP_FREQUENCY_HZ = 60.0  # Hz - Target frequency for the movement control loop
 
 # Turning toward a voice
-TURN_DURATION_S = 1.5
+TURN_DURATION_S = 1.5  # the shortest turn; bigger ones take longer
+TURN_MAX_DURATION_S = 3.0
+TURN_SPEED_RAD_S = math.radians(30)  # average speed of a voice turn
 TURN_COOLDOWN_S = 3.0
+# A voice turn that finds no face was a TV, a radio or an echo: voices from there are ignored for a while.
+VOICE_FACE_SETTLE_S = 0.5  # the tracker is paused while turning, so its face state is stale until then
+VOICE_FACE_WAIT_S = 3.0
+QUIET_DIRECTION_S = 600.0
 MAX_HEAD_YAW_RAD = math.radians(60)
 MIN_TURN_RAD = math.radians(12)  # smaller offsets are left to the tracker
 SAME_SPEAKER_RAD = math.radians(25)  # DoA error band: a voice this close to the tracked face is that person
@@ -383,6 +389,8 @@ class MovementManager:
         self._thermal_hold = False
         self._turn_until: float | None = None  # end of a turn toward a voice; tracking resumes then
         self._last_turn_time = -TURN_COOLDOWN_S
+        self._voice_check: tuple[float, float] | None = None  # (turn end, world yaw of the voice) awaiting a face
+        self._quiet_directions: list[tuple[float, float]] = []  # (world yaw, ignored until) of faceless voices
         self._held_body_yaw = 0.0  # body yaw between goto moves, so breathing doesn't undo a body turn
         self._body_turn_until: float | None = None
         self._neck_twisted_since: float | None = None
@@ -654,11 +662,16 @@ class MovementManager:
         face_yaw = -math.atan(float(face.x) * CAMERA_HALF_WIDTH_TAN)
         if abs(wrap_angle(yaw - face_yaw)) <= SAME_SPEAKER_RAD:
             return
+        voice_yaw = wrap_angle(head_yaw(head_pose) + yaw)
+        self._quiet_directions = [(d, until) for d, until in self._quiet_directions if until > current_time]
+        if any(abs(wrap_angle(voice_yaw - d)) <= SAME_SPEAKER_RAD for d, _ in self._quiet_directions):
+            return
         neck_yaw = wrap_angle(head_yaw(head_pose) - body_yaw)
         target_neck_yaw = max(-MAX_HEAD_YAW_RAD, min(MAX_HEAD_YAW_RAD, neck_yaw + yaw))
         if abs(target_neck_yaw - neck_yaw) < MIN_TURN_RAD:
             return
         target_yaw = body_yaw + target_neck_yaw
+        duration = min(TURN_MAX_DURATION_S, max(TURN_DURATION_S, abs(target_neck_yaw - neck_yaw) / TURN_SPEED_RAD_S))
         try:
             # Weight 0 pauses detection but keeps the tracker's face association, so on resume it picks
             # the face nearest where the last one was: the centre, where the speaker now is.
@@ -676,14 +689,15 @@ class MovementManager:
             start_antennas=antennas,
             target_body_yaw=body_yaw,
             start_body_yaw=body_yaw,
-            duration=TURN_DURATION_S,
+            duration=duration,
             ease=True,
         )
         self.state.move_start_time = current_time
         self.state.update_activity()
         self._breathing_active = False
         self._track_anchor = None
-        self._turn_until = current_time + TURN_DURATION_S
+        self._turn_until = current_time + duration
+        self._voice_check = (self._turn_until, voice_yaw)
         self._last_turn_time = current_time
         logger.info(
             "Voice %.0f° off the head, away from the tracked face; turning to yaw %.0f°",
@@ -938,6 +952,31 @@ class MovementManager:
         except Exception as e:
             logger.warning("Could not resume head tracking after turning: %s", e)
 
+    def _check_voice_turn(self, current_time: float) -> None:
+        """Once a voice turn has played out, mark its direction quiet if no face turns up there."""
+        if self._voice_check is None or self._turn_until is not None:
+            return
+        turn_end, voice_yaw = self._voice_check
+        if current_time < turn_end + VOICE_FACE_SETTLE_S:
+            return
+        try:
+            face = self.current_robot.get_tracked_face(wait=False)
+        except Exception as e:
+            logger.warning("Cannot check for a face after turning, robot state unavailable: %s", e)
+            return
+        if face.detected:
+            self._voice_check = None
+            return
+        if current_time < turn_end + VOICE_FACE_WAIT_S:
+            return
+        self._voice_check = None
+        self._quiet_directions.append((voice_yaw, current_time + QUIET_DIRECTION_S))
+        logger.info(
+            "Nobody where the voice came from (yaw %.0f°); ignoring voices from there for %.0f min",
+            math.degrees(voice_yaw),
+            QUIET_DIRECTION_S / 60,
+        )
+
     def _set_dozing(self, dozing: bool, current_time: float, lazy: bool = False) -> None:
         """Enter or leave the doze pose (worker thread only)."""
         if self._dozing == dozing:
@@ -1092,6 +1131,7 @@ class MovementManager:
     def _update_primary_motion(self, current_time: float) -> None:
         """Advance queue state and idle behaviours for this tick."""
         self._finish_turn(current_time)
+        self._check_voice_turn(current_time)
         self._watch_for_face(current_time)
         self._follow_with_body(current_time)
         self._guard_limits(current_time)

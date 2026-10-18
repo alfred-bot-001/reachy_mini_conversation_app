@@ -7,6 +7,7 @@ ones (or a motor that has already latched its overheating error) get their torqu
 """
 
 import json
+import math
 import time
 import struct
 import logging
@@ -21,7 +22,7 @@ import httpx
 from websockets.sync.client import ClientConnection, connect
 
 from reachy_mini import ReachyMini
-from reachy_mini_conversation_app.moves import MovementManager
+from reachy_mini_conversation_app.moves import MovementManager, rotation_between
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,11 @@ COOL_C = 48  # every motor at or below this ends the hold
 
 POLL_S = 30.0
 WARM_POLL_S = 10.0
+# Bus reads can collide with the daemon's control loop and drop a frame, so they wait for the head to be still.
+IDLE_RETRY_S = 5.0
+STILL_RAD = math.radians(1.5)
+MAX_UNSAMPLED_S = 300.0  # read anyway after this long without a still moment
+WARM_MAX_UNSAMPLED_S = 60.0
 _READ_FAILURE_LOG_S = 600.0
 
 LOG_FILENAME = "motor_health.jsonl"
@@ -107,10 +113,12 @@ def read_packet(motor_id: int, address: int, length: int) -> bytes:
     return body + struct.pack("<H", _crc16(body))
 
 
-def parse_status(packet: bytes, length: int) -> tuple[int, bytes]:
-    """Return the error byte and ``length`` data bytes of a status packet; ValueError if it is malformed."""
+def parse_status(packet: bytes, motor_id: int, length: int) -> tuple[int, bytes]:
+    """Return the error byte and ``length`` data bytes of ``motor_id``'s status packet; ValueError otherwise."""
     if len(packet) < 11 + length or packet[:4] != b"\xff\xff\xfd\x00" or packet[7] != 0x55:
         raise ValueError(f"not a status packet: {packet.hex()}")
+    if packet[4] != motor_id:
+        raise ValueError(f"reply from motor {packet[4]}, expected motor {motor_id}")
     end = 9 + length
     if struct.unpack("<H", packet[end : end + 2])[0] != _crc16(packet[:end]):
         raise ValueError(f"bad status packet CRC: {packet.hex()}")
@@ -134,7 +142,7 @@ class DaemonMotorBus:
         reply = self._ws.recv(timeout=2.0)
         if isinstance(reply, str):
             raise ValueError("expected a binary status packet")
-        return parse_status(reply, length)
+        return parse_status(reply, motor_id, length)
 
     def read_all(self) -> dict[str, MotorReading]:
         """Read every motor; any failure drops the connection so the next call reconnects."""
@@ -189,6 +197,9 @@ class MotorHealthMonitor:
         self._holding = False
         self._torque_off = False
         self._last_failure_log = -_READ_FAILURE_LOG_S
+        self._last_sample_at = time.monotonic()
+        self._warm = False
+        self._last_pose = (robot.get_current_head_pose(), float(robot.get_current_joint_positions()[0][0]))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -204,13 +215,26 @@ class MotorHealthMonitor:
         """Take one sample, act on it and return the seconds until the next one."""
         try:
             if self._bus.is_moving():
-                return WARM_POLL_S
+                return IDLE_RETRY_S
+            head, body_yaw = (
+                self._robot.get_current_head_pose(),
+                float(self._robot.get_current_joint_positions()[0][0]),
+            )
+            last_head, last_body_yaw = self._last_pose
+            self._last_pose = (head, body_yaw)
+            still = rotation_between(last_head, head) <= STILL_RAD and abs(body_yaw - last_body_yaw) <= STILL_RAD
+            overdue = time.monotonic() - self._last_sample_at >= (
+                WARM_MAX_UNSAMPLED_S if self._warm else MAX_UNSAMPLED_S
+            )
+            if not (still or overdue):
+                return IDLE_RETRY_S
             readings = self._bus.read_all()
         except Exception as e:
             if time.monotonic() - self._last_failure_log >= _READ_FAILURE_LOG_S:
                 logger.warning("Could not read motor temperatures: %s", e)
                 self._last_failure_log = time.monotonic()
             return POLL_S
+        self._last_sample_at = time.monotonic()
 
         status = self._movement_manager.get_status()
         motion_keys = ("dozing", "thermal_hold", "head_tracking", "turning", "at_limit", "queue_size")
@@ -244,10 +268,11 @@ class MotorHealthMonitor:
                 self._torque_off = False
             self._movement_manager.set_thermal_hold(False)
             self._holding = False
-        return WARM_POLL_S if hottest[1] >= WARM_C else POLL_S
+        self._warm = hottest[1] >= WARM_C
+        return WARM_POLL_S if self._warm else POLL_S
 
     def _run(self) -> None:
-        delay = 0.0
+        delay = IDLE_RETRY_S
         while not self._stop.wait(delay):
             try:
                 delay = self.poll_once()
