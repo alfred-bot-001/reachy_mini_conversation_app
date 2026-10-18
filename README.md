@@ -107,6 +107,8 @@ Copy `.env.example` to `.env` when you want to point Hugging Face at your own lo
 | `HF_REALTIME_WS_URL` | Direct websocket endpoint for your own Hugging Face backend. Accepts either a base URL like `ws://127.0.0.1:8765/v1` or the full websocket URL `ws://127.0.0.1:8765/v1/realtime`. Used when `HF_REALTIME_CONNECTION_MODE=local`. |
 | `HF_TOKEN` | Optional token for Hugging Face access. Local endpoints receive only this explicitly configured token. |
 | `REACHY_MINI_APP_TIMEOUT_MINUTES` | Minutes of inactivity before Reachy goes to sleep and the app stops. Defaults to `1440` (one day); set to `0` to disable. |
+| `REACHY_MINI_MOTOR_WATCHDOG` | Motor temperature log and watchdog, on by default. Motors are sampled every 30 s (10 s from 50 °C, never while the daemon plays a move); at 55 °C the head rests in the doze pose and ignores wake-ups, at 65 °C or on a motor overheating error the torque is turned off; both end once every motor is back at 48 °C. Set to `0` to disable. |
+| `REACHY_MINI_MOTOR_LOG_DIR` | Where the rotating `motor_health.jsonl` temperature log (with the motion state at each sample) is written. Defaults to `~/workspace-agent/agent-data/reachy-mini/motor-health`. |
 
 ### Hugging Face Connection Modes
 

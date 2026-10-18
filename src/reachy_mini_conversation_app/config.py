@@ -156,10 +156,31 @@ def face_follow_enabled() -> bool:
     return _env_flag(FACE_FOLLOW_ENV, default=True)
 
 
+def resolve_daemon_url() -> str:
+    """Return the base URL of the Reachy Mini daemon's HTTP API."""
+    return (os.getenv(DAEMON_URL_ENV, "").strip() or DEFAULT_DAEMON_URL).rstrip("/")
+
+
 def resolve_daemon_doa_url() -> str:
     """URL of the daemon's sound direction-of-arrival endpoint, polled while the user speaks."""
-    base_url = os.getenv(DAEMON_URL_ENV, "").strip() or DEFAULT_DAEMON_URL
-    return base_url.rstrip("/") + "/api/state/doa"
+    return resolve_daemon_url() + "/api/state/doa"
+
+
+MOTOR_WATCHDOG_ENV = "REACHY_MINI_MOTOR_WATCHDOG"
+MOTOR_LOG_DIR_ENV = "REACHY_MINI_MOTOR_LOG_DIR"
+
+
+def motor_watchdog_enabled() -> bool:
+    """Return whether motor temperatures are logged and hot motors protected (on by default)."""
+    return _env_flag(MOTOR_WATCHDOG_ENV, default=True)
+
+
+def resolve_motor_log_dir() -> Path:
+    """Directory for the motor temperature log, kept apart from the installed app so it survives updates."""
+    raw_value = os.getenv(MOTOR_LOG_DIR_ENV, "").strip()
+    if raw_value:
+        return Path(raw_value).expanduser()
+    return Path.home() / "workspace-agent" / "agent-data" / "reachy-mini" / "motor-health"
 
 
 def speech_wobble_enabled() -> bool:

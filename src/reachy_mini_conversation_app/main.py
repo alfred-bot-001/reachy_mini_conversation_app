@@ -90,14 +90,18 @@ def run(
     from reachy_mini_conversation_app.config import (
         HF_LOCAL_CONNECTION_MODE,
         set_instance_path,
+        resolve_daemon_url,
         face_follow_enabled,
         resolve_doze_minutes,
+        resolve_motor_log_dir,
         speech_wobble_enabled,
+        motor_watchdog_enabled,
         resolve_daemon_doa_url,
         get_hf_connection_selection,
         resolve_app_timeout_minutes,
         refresh_runtime_config_from_env,
     )
+    from reachy_mini_conversation_app.motor_health import DaemonMotorBus, MotorHealthMonitor
     from reachy_mini_conversation_app.startup_settings import (
         StartupSettings,
         load_startup_settings_into_runtime,
@@ -294,6 +298,17 @@ def run(
 
     # Each async service → its own thread/loop
     movement_manager.start()
+    motor_health: MotorHealthMonitor | None = None
+    if motor_watchdog_enabled():
+        try:
+            motor_log_dir = resolve_motor_log_dir()
+            motor_health = MotorHealthMonitor(
+                DaemonMotorBus(resolve_daemon_url()), robot, movement_manager, motor_log_dir
+            )
+            motor_health.start()
+            logger.info("Motor watchdog on; temperature log in %s", motor_log_dir)
+        except OSError as e:
+            logger.error("Motor watchdog disabled, cannot open its log: %s", e)
     if speaker_attention is not None:
         speaker_attention.start()
         movement_manager.set_head_tracking(True)
@@ -353,6 +368,8 @@ def run(
         # the daemon returns it to neutral once the process exits.
         if speaker_attention is not None:
             speaker_attention.stop()
+        if motor_health is not None:
+            motor_health.close()
         movement_manager.stop(reset_to_neutral=False)
         try:
             robot.disable_wobbling()

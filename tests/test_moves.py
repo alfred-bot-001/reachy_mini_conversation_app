@@ -454,6 +454,29 @@ def test_dozing_cancels_a_turn_and_listening_notifies_attention() -> None:
     assert heard == [True]
 
 
+def test_a_thermal_hold_dozes_ignores_wake_ups_and_restores_the_requested_state() -> None:
+    """Hot motors force the doze pose; waking waits for the release, which restores what was last asked for."""
+    manager, _ = _tracking_manager(_Face(detected=False))
+    now = manager._now()
+
+    manager._handle_command("thermal_hold", True, now)
+    assert manager.get_status()["dozing"] is True
+    assert manager.get_status()["thermal_hold"] is True
+
+    manager._handle_command("set_dozing", False, now)
+    manager._handle_command("lazy_wake", None, now)
+    assert manager.get_status()["dozing"] is True
+
+    manager._handle_command("thermal_hold", False, now)
+    assert manager.get_status()["dozing"] is False
+    assert manager.get_status()["thermal_hold"] is False
+
+    manager._handle_command("set_dozing", True, now)
+    manager._handle_command("thermal_hold", True, now)
+    manager._handle_command("thermal_hold", False, now)
+    assert manager.get_status()["dozing"] is True
+
+
 def _hold_neck(manager: MovementManager, start: float, seconds: float) -> None:
     for step in range(int(seconds * 10) + 1):
         manager._follow_with_body(start + step * 0.1)

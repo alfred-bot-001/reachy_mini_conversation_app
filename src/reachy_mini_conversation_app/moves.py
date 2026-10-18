@@ -379,6 +379,8 @@ class MovementManager:
         self._last_listening_blend_time = self._now()
         self._breathing_active = False  # true when breathing move is running or queued
         self._dozing = False  # true while holding the doze pose; new moves are rejected
+        self._requested_dozing = False  # what the conversation last asked for, restored after a thermal hold
+        self._thermal_hold = False
         self._turn_until: float | None = None  # end of a turn toward a voice; tracking resumes then
         self._last_turn_time = -TURN_COOLDOWN_S
         self._held_body_yaw = 0.0  # body yaw between goto moves, so breathing doesn't undo a body turn
@@ -488,6 +490,10 @@ class MovementManager:
         """Leave the doze pose with the slow, sleepy wake-up and a look around (thread-safe)."""
         self._command_queue.put(("lazy_wake", None))
 
+    def set_thermal_hold(self, hold: bool) -> None:
+        """Rest in the doze pose while motors are hot, ignoring wake-ups until released (thread-safe)."""
+        self._command_queue.put(("thermal_hold", hold))
+
     def set_speaking(self, speaking: bool) -> None:
         """Pause head tracking while the assistant speaks, resume it afterwards.
 
@@ -593,9 +599,16 @@ class MovementManager:
             except Exception as e:
                 logger.warning("Head-tracking toggle failed: %s", e)
         elif command == "set_dozing":
-            self._set_dozing(bool(payload), current_time)
+            self._requested_dozing = bool(payload)
+            if not self._thermal_hold:
+                self._set_dozing(self._requested_dozing, current_time)
         elif command == "lazy_wake":
-            self._set_dozing(False, current_time, lazy=True)
+            self._requested_dozing = False
+            if not self._thermal_hold:
+                self._set_dozing(False, current_time, lazy=True)
+        elif command == "thermal_hold":
+            self._thermal_hold = bool(payload)
+            self._set_dozing(self._thermal_hold or self._requested_dozing, current_time)
         elif command == "look_toward":
             self._look_toward(float(payload), current_time)
         elif command == "set_speaking":
@@ -1280,6 +1293,7 @@ class MovementManager:
             "is_listening": self._is_listening,
             "breathing_active": self._breathing_active,
             "dozing": self._dozing,
+            "thermal_hold": self._thermal_hold,
             "head_tracking": self._head_tracking,
             "turning": self._turn_until is not None,
             "at_limit": self._limit_hold_until is not None,

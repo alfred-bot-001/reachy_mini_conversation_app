@@ -20,3 +20,11 @@ def test_resolve_app_timeout_minutes(monkeypatch, raw_value, expected) -> None:
     monkeypatch.setenv(config.APP_TIMEOUT_MINUTES_ENV, raw_value)
 
     assert config.resolve_app_timeout_minutes() == expected
+
+
+def test_motor_log_dir_defaults_outside_the_app_and_can_be_overridden(monkeypatch, tmp_path) -> None:
+    """The log lives under agent-data unless REACHY_MINI_MOTOR_LOG_DIR points elsewhere."""
+    monkeypatch.delenv(config.MOTOR_LOG_DIR_ENV, raising=False)
+    assert config.resolve_motor_log_dir().parts[-3:] == ("agent-data", "reachy-mini", "motor-health")
+    monkeypatch.setenv(config.MOTOR_LOG_DIR_ENV, str(tmp_path))
+    assert config.resolve_motor_log_dir() == tmp_path
