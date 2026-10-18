@@ -170,9 +170,11 @@ MOTOR_WATCHDOG_ENV = "REACHY_MINI_MOTOR_WATCHDOG"
 MOTOR_LOG_DIR_ENV = "REACHY_MINI_MOTOR_LOG_DIR"
 
 
+# Temperatures can only be read through the daemon's raw-packet websocket, which serves each packet with a blocking
+# serial call on its event loop; a read colliding with the control loop has frozen the whole daemon.
 def motor_watchdog_enabled() -> bool:
-    """Return whether motor temperatures are logged and hot motors protected (on by default)."""
-    return _env_flag(MOTOR_WATCHDOG_ENV, default=True)
+    """Return whether motor temperatures are logged and hot motors protected (off: for troubleshooting only)."""
+    return _env_flag(MOTOR_WATCHDOG_ENV, default=False)
 
 
 def resolve_motor_log_dir() -> Path:

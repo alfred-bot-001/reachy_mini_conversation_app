@@ -28,3 +28,11 @@ def test_motor_log_dir_defaults_outside_the_app_and_can_be_overridden(monkeypatc
     assert config.resolve_motor_log_dir().parts[-3:] == ("agent-data", "reachy-mini", "motor-health")
     monkeypatch.setenv(config.MOTOR_LOG_DIR_ENV, str(tmp_path))
     assert config.resolve_motor_log_dir() == tmp_path
+
+
+def test_motor_watchdog_is_off_unless_asked_for(monkeypatch) -> None:
+    """Its raw bus reads can freeze the daemon, so it only runs when explicitly enabled."""
+    monkeypatch.delenv(config.MOTOR_WATCHDOG_ENV, raising=False)
+    assert config.motor_watchdog_enabled() is False
+    monkeypatch.setenv(config.MOTOR_WATCHDOG_ENV, "1")
+    assert config.motor_watchdog_enabled() is True
