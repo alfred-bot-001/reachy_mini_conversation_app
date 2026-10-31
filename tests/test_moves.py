@@ -18,6 +18,7 @@ from reachy_mini_conversation_app.moves import (
     VOICE_FACE_WAIT_S,
     BODY_FOLLOW_DELAY_S,
     RECENTER_DURATION_S,
+    TRACK_PITCH_CAP_RAD,
     TURN_MAX_DURATION_S,
     BODY_FOLLOW_COOLDOWN_S,
     BODY_FOLLOW_DURATION_S,
@@ -25,6 +26,8 @@ from reachy_mini_conversation_app.moves import (
     BreathingMove,
     MovementManager,
     LoopFrequencyStats,
+    head_yaw,
+    head_pitch,
     clone_full_body_pose,
 )
 from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove, EmotionQueueMove
@@ -433,9 +436,12 @@ def test_a_neck_held_round_turns_the_body_under_the_head_and_idling_keeps_it_the
 
 
 def test_a_face_the_head_cannot_reach_pauses_tracking_holds_the_pose_and_retries_later() -> None:
-    """A face far below centre with the head not moving is a joint limit: stop pushing, hold, try again later."""
-    manager, robot = _tracking_manager(_Face(detected=True, x=0.0, y=0.7))
-    held_pose = create_head_pose(0, 0, 0, 0, 30, 0, degrees=True)
+    """A face far above centre with the head not moving is a joint limit: stop pushing, hold, try again later.
+
+    Nose-up here: nose-down never gets this far, the shell cap catches it first.
+    """
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0, y=-0.7))
+    held_pose = create_head_pose(0, 0, 0, 0, -30, 0, degrees=True)
     robot.get_current_head_pose.return_value = held_pose
     now = manager._now()
     manager._guard_limits(now)
@@ -465,14 +471,14 @@ def test_a_face_the_head_cannot_reach_pauses_tracking_holds_the_pose_and_retries
 
 def test_tracking_keeps_going_while_the_head_still_moves_or_is_not_over_to_the_face_side() -> None:
     """A head still moving, settled near neutral (faces sit a little high), or pitched the other way is no limit."""
-    face = _Face(detected=True, x=0.0, y=0.7)
+    face = _Face(detected=True, x=0.0, y=-0.7)
     manager, robot = _tracking_manager(face)
     now = manager._now()
-    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 32, 0, degrees=True)
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, -32, 0, degrees=True)
     manager._guard_limits(now)
-    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 36, 0, degrees=True)
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, -36, 0, degrees=True)
     manager._guard_limits(now + 0.7)
-    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 40, 0, degrees=True)
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, -40, 0, degrees=True)
     manager._guard_limits(now + 1.4)
     robot.start_head_tracking.assert_not_called()
 
@@ -483,12 +489,56 @@ def test_tracking_keeps_going_while_the_head_still_moves_or_is_not_over_to_the_f
         manager._guard_limits(now + seconds)
     robot.start_head_tracking.assert_not_called()
 
-    # Pitched well down but the face is above: the head can come back up, nothing is blocked.
+    # Pitched down but still under the shell cap, face above: the head can come back up, nothing is blocked.
     face.y = -0.5
-    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 35, 0, degrees=True)
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 20, 0, degrees=True)
     for seconds in (11.0, 12.0, 13.0):
         manager._guard_limits(now + seconds)
     robot.start_head_tracking.assert_not_called()
+
+    # Face low, head sinking toward the cap but not there yet: no limit, however long it takes.
+    face.y = 0.7
+    for seconds, degrees in ((14.0, 10), (14.7, 18), (15.4, np.degrees(TRACK_PITCH_CAP_RAD) - 0.5)):
+        robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, degrees, 0, degrees=True)
+        manager._guard_limits(now + seconds)
+    robot.start_head_tracking.assert_not_called()
+
+
+def test_tracking_never_pitches_the_head_past_the_shell_cap() -> None:
+    """Head already past the cap: pause at once (no stillness wait) and hold the capped pose, same yaw, at z=0."""
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0, y=0.3))
+    over = create_head_pose(0, 0, 0, 0, np.degrees(TRACK_PITCH_CAP_RAD) + 3, 20, degrees=True)
+    robot.get_current_head_pose.return_value = over
+    now = manager._now()
+    manager._guard_limits(now)
+    robot.start_head_tracking.assert_called_once_with(weight=0.0)
+    assert manager.get_status()["at_limit"] is True
+
+    manager.state.current_move = BreathingMove(over, (0.0, 0.0))
+    manager.state.move_start_time = now
+    head, _, _ = manager._get_primary_pose(now + 0.5)
+    assert head_pitch(head) == pytest.approx(TRACK_PITCH_CAP_RAD, abs=1e-6)
+    assert head_yaw(head) == pytest.approx(np.radians(20), abs=1e-6)
+    assert np.allclose(head[:3, 3], 0.0)
+
+    # Resumes after the hold; dipping past the cap again straight away doubles the next hold.
+    robot.start_head_tracking.reset_mock()
+    resumed_at = now + LIMIT_HOLD_S
+    manager._guard_limits(resumed_at)
+    robot.start_head_tracking.assert_called_once_with(weight=1.0)
+    assert manager.get_status()["at_limit"] is False
+    manager._guard_limits(resumed_at + 0.1)
+    assert manager._limit_hold_until == pytest.approx(resumed_at + 0.1 + 2 * LIMIT_HOLD_S)
+
+
+def test_the_shell_cap_applies_even_when_the_tracker_has_lost_the_face() -> None:
+    """The daemon may still be easing the head down from a stale aim: the cap is about the pose, not the face."""
+    manager, robot = _tracking_manager(_Face(detected=False))
+    robot.get_current_head_pose.return_value = create_head_pose(
+        0, 0, 0, 0, np.degrees(TRACK_PITCH_CAP_RAD) + 1, 0, degrees=True
+    )
+    manager._guard_limits(manager._now())
+    robot.start_head_tracking.assert_called_once_with(weight=0.0)
 
 
 def test_a_neck_at_its_limit_with_the_face_further_round_is_a_limit_too() -> None:
@@ -630,8 +680,8 @@ def test_speech_end_holds_the_head_until_the_tracker_has_the_face_again() -> Non
 
 def test_a_limit_hold_hands_back_without_dropping_the_pose() -> None:
     """When a limit hold ends, the held pose stays until the tracker sees the face again."""
-    manager, robot = _tracking_manager(_Face(detected=True, x=0.0, y=0.7))
-    held_pose = create_head_pose(0, 0, 0, 0, 30, 0, degrees=True)
+    manager, robot = _tracking_manager(_Face(detected=True, x=0.0, y=-0.7))
+    held_pose = create_head_pose(0, 0, 0, 0, -30, 0, degrees=True)
     robot.get_current_head_pose.return_value = held_pose
     now = manager._now()
     manager._guard_limits(now)

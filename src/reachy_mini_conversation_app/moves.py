@@ -16,7 +16,10 @@ Design overview
   the speaker. With no face in view, voices are ignored.
 - Face following knows its limits: a neck held well round turns the body under the
   head, and when the head stops short of the face (a joint limit) tracking pauses
-  and the pose is held instead of straining, with a retry a little later. The body
+  and the pose is held instead of straining, with a retry a little later. Nose-down
+  the limit is the body shell, not a joint: past `TRACK_PITCH_CAP_RAD` tracking is
+  paused at once and the head held at the cap (the daemon's IK would happily go on
+  to ~52°, straight into the shell). The body
   follows only a settled, centred face, rests between turns and never swings
   straight back the other way.
 - A lost face leaves the head where it is: before the daemon would recentre it on
@@ -113,6 +116,10 @@ LIMIT_STILL_S = 0.6
 LIMIT_HOLD_S = 3.0
 LIMIT_HOLD_MAX_S = 12.0
 LIMIT_RETRY_WINDOW_S = 1.5  # stuck again this soon after a hold: hold twice as long next time
+# Shell cap: nose-down, the head meets the body shell long before the daemon's IK gives up (~52° at z=0), and
+# the daemon tracker aims straight at the face with nothing in between. Past this pitch, tracking is paused
+# at once (no stillness wait) and the head is held at the cap, same yaw, until the usual limit hold expires.
+TRACK_PITCH_CAP_RAD = math.radians(25)  # provisional until measured on the robot
 
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
@@ -901,11 +908,21 @@ class MovementManager:
             logger.warning("Cannot check the tracking limits, robot state unavailable: %s", e)
             self._still_since = None
             return
+        pitch = head_pitch(head_pose)
+        if pitch >= TRACK_PITCH_CAP_RAD:
+            # Nose-down into the shell: stop at the cap right now, whether or not a face is still in view.
+            capped = create_head_pose(0, 0, 0, 0, TRACK_PITCH_CAP_RAD, head_yaw(head_pose), degrees=False)
+            self._hold_at_limit(
+                capped,
+                current_time,
+                "Head %.0f° nose-down, past the %.0f° shell cap"
+                % (math.degrees(pitch), math.degrees(TRACK_PITCH_CAP_RAD)),
+            )
+            return
         if not face.detected or face.x is None or face.y is None:
             self._still_since = None
             return
         # Image y grows downward like a nose-down pitch; image x grows to the right, against a leftward yaw.
-        pitch = head_pitch(head_pose)
         neck_yaw = wrap_angle(head_yaw(head_pose) - body_yaw)
         face_beyond_pitch = abs(pitch) >= LIMIT_PITCH_RAD and face.y * pitch > 0 and abs(face.y) > LIMIT_FACE_OFFSET
         face_beyond_yaw = (
@@ -920,6 +937,12 @@ class MovementManager:
             return
         if current_time - self._still_since[0] < LIMIT_STILL_S:
             return
+        self._hold_at_limit(
+            head_pose, current_time, "Face at (%.2f, %.2f) but the head stopped short" % (face.x, face.y)
+        )
+
+    def _hold_at_limit(self, anchor: NDArray[np.float64], current_time: float, reason: str) -> None:
+        """Pause the tracker and hold ``anchor`` for the limit hold time (doubling when stuck again at once)."""
         if self._limit_retry_until is not None and current_time < self._limit_retry_until:
             self._limit_hold_s = min(self._limit_hold_s * 2, LIMIT_HOLD_MAX_S)
         try:
@@ -928,15 +951,10 @@ class MovementManager:
             logger.warning("Could not pause head tracking at a limit: %s", e)
             self._still_since = None
             return
-        self._limit_anchor = head_pose
+        self._limit_anchor = anchor
         self._limit_hold_until = current_time + self._limit_hold_s
         self._still_since = None
-        logger.info(
-            "Face at (%.2f, %.2f) but the head stopped short; holding still for %.0fs",
-            face.x,
-            face.y,
-            self._limit_hold_s,
-        )
+        logger.info("%s; holding still for %.0fs", reason, self._limit_hold_s)
 
     def _finish_turn(self, current_time: float) -> None:
         """Hand the head back to the tracker once a turn toward a voice has played out."""
