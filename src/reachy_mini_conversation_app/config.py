@@ -132,8 +132,10 @@ DEFAULT_WAKE_WORDS = ("小白", "小百", "晓白", "小柏", "筱白", "小拜"
 
 
 FRAME_CLIENTS_ENV = "REACHY_MINI_FRAME_CLIENTS"
-# The home server that recognises faces in the background (agent001).
-DEFAULT_FRAME_CLIENTS = ("192.168.1.123",)
+# Nobody may pull camera frames unless REACHY_MINI_FRAME_CLIENTS lists them
+# (comma-separated IPs). The home face-recognition server is configured in the
+# robot's instance .env, not hard-coded here.
+DEFAULT_FRAME_CLIENTS: tuple[str, ...] = ()
 
 
 def resolve_frame_clients() -> frozenset[str]:

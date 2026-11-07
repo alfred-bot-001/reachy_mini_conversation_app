@@ -899,7 +899,7 @@ def test_camera_frame_is_served_only_to_allowlisted_clients(monkeypatch: pytest.
     assert response.headers["cache-control"] == "no-store"
     assert response.content == b"\xff\xd8jpeg"
 
-    # Default allowlist is the home server only; the test client is not it.
+    # Default allowlist is empty: without REACHY_MINI_FRAME_CLIENTS nobody gets frames.
     assert _frame_client(monkeypatch, None, b"x").get("/api/camera/frame.jpg").status_code == 403
     assert _frame_client(monkeypatch, "none", b"x").get("/api/camera/frame.jpg").status_code == 403
     assert _frame_client(monkeypatch, "testclient", None).get("/api/camera/frame.jpg").status_code == 503
