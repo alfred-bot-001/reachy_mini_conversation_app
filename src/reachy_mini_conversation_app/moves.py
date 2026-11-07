@@ -61,9 +61,10 @@ from numpy.typing import NDArray
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
 from reachy_mini.motion.move import Move
-from reachy_mini.reachy_mini import SLEEP_HEAD_POSE, SLEEP_ANTENNAS_JOINT_POSITIONS
+from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
 from reachy_mini.utils.interpolation import compose_world_offset, linear_pose_interpolation
 from reachy_mini_conversation_app.attention import wrap_angle
+from reachy_mini_conversation_app.antenna_guard import AntennaStallGuard
 from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove, EmotionQueueMove
 
 
@@ -120,6 +121,10 @@ LIMIT_RETRY_WINDOW_S = 1.5  # stuck again this soon after a hold: hold twice as 
 # the daemon tracker aims straight at the face with nothing in between. Past this pitch, tracking is paused
 # at once (no stillness wait) and the head is held at the cap, same yaw, until the usual limit hold expires.
 TRACK_PITCH_CAP_RAD = math.radians(25)  # provisional until measured on the robot
+# Doze antennas: the SDK's sleep pose folds them to ±3.05 rad, right on the mechanical stop, and holding there
+# overloaded the left antenna motor on 2026-11-05 (torque cut, error latched until a power cycle). Stop short.
+DOZE_ANTENNAS_RAD = 2.9
+DOZE_ANTENNAS_JOINT_POSITIONS = (-DOZE_ANTENNAS_RAD, DOZE_ANTENNAS_RAD)
 
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
@@ -212,7 +217,7 @@ class DozeMove(Move):  # type: ignore
         self.start_antennas = np.array(start_antennas, dtype=np.float64)
         self.transition_duration = transition_duration
         self.sleep_pose = np.array(SLEEP_HEAD_POSE, dtype=np.float64)
-        self.sleep_antennas = np.array(SLEEP_ANTENNAS_JOINT_POSITIONS, dtype=np.float64)
+        self.sleep_antennas = np.array(DOZE_ANTENNAS_JOINT_POSITIONS, dtype=np.float64)
 
     @property
     def duration(self) -> float:
@@ -357,10 +362,14 @@ class MovementManager:
     def __init__(
         self,
         current_robot: ReachyMini,
+        antenna_guard: bool = True,
     ):
-        """Initialize movement manager."""
+        """Initialize movement manager; ``antenna_guard`` yields a blocked antenna before its motor overloads."""
         self.current_robot = current_robot
         self._head_tracking = False
+        self._antenna_guards: tuple[AntennaStallGuard, AntennaStallGuard] | None = (
+            (AntennaStallGuard("left"), AntennaStallGuard("right")) if antenna_guard else None
+        )
 
         # Single timing source for durations
         self._now = time.monotonic
@@ -1192,6 +1201,24 @@ class MovementManager:
 
         return antennas_cmd
 
+    def _guard_antennas(self, antennas: Tuple[float, float], current_time: float) -> Tuple[float, float]:
+        """Hold back an antenna that is blocked on its way to ``antennas`` (see antenna_guard.py)."""
+        if self._antenna_guards is None:
+            return antennas
+        try:
+            # Latest reported joint positions; no I/O, same call breathing makes inside the loop.
+            _, present = self.current_robot.get_current_joint_positions()
+            present = [float(p) for p in present]
+        except Exception:
+            return antennas
+        if len(present) < 2:
+            return antennas
+        left, right = self._antenna_guards
+        return (
+            left.command(float(antennas[0]), present[0], current_time),
+            right.command(float(antennas[1]), present[1], current_time),
+        )
+
     def _issue_control_command(
         self, head: NDArray[np.float32], antennas: Tuple[float, float], body_yaw: float
     ) -> None:
@@ -1355,6 +1382,7 @@ class MovementManager:
             "head_tracking": self._head_tracking,
             "turning": self._turn_until is not None,
             "at_limit": self._limit_hold_until is not None,
+            "antenna_blocked": [g.name for g in self._antenna_guards or () if g.blocked],
             "last_commanded_pose": {
                 "head": head_matrix,
                 "antennas": antennas,
@@ -1397,6 +1425,9 @@ class MovementManager:
 
             # 4) Apply listening antenna freeze or blend-back
             antennas_cmd = self._calculate_blended_antennas(antennas)
+
+            # 4b) Yield an antenna that is blocked, before its motor overloads and shuts itself down
+            antennas_cmd = self._guard_antennas(antennas_cmd, loop_start)
 
             # 5) Single set_target call - the only control point
             self._issue_control_command(head, antennas_cmd, body_yaw)

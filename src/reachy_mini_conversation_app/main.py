@@ -93,6 +93,7 @@ def run(
         resolve_daemon_url,
         face_follow_enabled,
         resolve_doze_minutes,
+        antenna_guard_enabled,
         resolve_motor_log_dir,
         speech_wobble_enabled,
         motor_watchdog_enabled,
@@ -164,7 +165,7 @@ def run(
 
     app_lifecycle.wake_up_if_sleeping(robot, logger)
 
-    movement_manager = MovementManager(current_robot=robot)
+    movement_manager = MovementManager(current_robot=robot, antenna_guard=antenna_guard_enabled())
     speaker_attention: SpeakerAttention | None = None
     if face_follow_enabled():
         speaker_attention = SpeakerAttention(movement_manager, resolve_daemon_doa_url())
