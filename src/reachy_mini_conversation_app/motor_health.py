@@ -27,7 +27,8 @@ from reachy_mini_conversation_app.moves import MovementManager, rotation_between
 
 logger = logging.getLogger(__name__)
 
-# Motor IDs on the Reachy Mini bus.
+# Motor IDs on the Reachy Mini bus, as the daemon names them (reachy_mini/assets/config/hardware_config.yaml).
+# The antennas are right = 17, left = 18; ``tests/test_motor_health.py`` checks this table against the SDK's config.
 MOTOR_IDS = {
     "body_rotation": 10,
     "stewart_1": 11,
@@ -36,8 +37,8 @@ MOTOR_IDS = {
     "stewart_4": 14,
     "stewart_5": 15,
     "stewart_6": 16,
-    "left_antenna": 17,
-    "right_antenna": 18,
+    "right_antenna": 17,
+    "left_antenna": 18,
 }
 
 # XL330 control table: present current (126) through present temperature (146) in one read.
