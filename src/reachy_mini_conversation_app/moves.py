@@ -65,7 +65,7 @@ from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
 from reachy_mini.utils.interpolation import compose_world_offset, linear_pose_interpolation
 from reachy_mini_conversation_app.attention import wrap_angle
 from reachy_mini_conversation_app.antenna_guard import AntennaStallGuard
-from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove, EmotionQueueMove
+from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove, DanceQueueMove, EmotionQueueMove
 
 
 logger = logging.getLogger(__name__)
@@ -125,6 +125,9 @@ TRACK_PITCH_CAP_RAD = math.radians(25)  # provisional until measured on the robo
 # overloaded the left antenna motor on 2026-11-05 (torque cut, error latched until a power cycle). Stop short.
 DOZE_ANTENNAS_RAD = 2.9
 DOZE_ANTENNAS_JOINT_POSITIONS = (-DOZE_ANTENNAS_RAD, DOZE_ANTENNAS_RAD)
+# Antennas placed on request (the set_antennas tool) are held there, through breathing and head moves, until
+# released or until the robot dozes off. Each change eases over this long by default.
+ANTENNA_HOLD_BLEND_S = 1.2
 
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
@@ -408,6 +411,9 @@ class MovementManager:
         self._voice_check: tuple[float, float] | None = None  # (turn end, world yaw of the voice) awaiting a face
         self._quiet_directions: list[tuple[float, float]] = []  # (world yaw, ignored until) of faceless voices
         self._held_body_yaw = 0.0  # body yaw between goto moves, so breathing doesn't undo a body turn
+        # Antennas held on request: (from, to, blend start, blend duration); None when breathing owns them.
+        self._antenna_hold: tuple[Tuple[float, float], Tuple[float, float], float, float] | None = None
+        self._antenna_hold_paused = False  # an expressive move (emotion, dance, wake-up) has the antennas for now
         self._body_turn_until: float | None = None
         self._neck_twisted_since: float | None = None
         self._last_body_turn: tuple[float, float] | None = None  # (time, direction sign) of the last body turn
@@ -517,6 +523,18 @@ class MovementManager:
     def set_thermal_hold(self, hold: bool) -> None:
         """Rest in the doze pose while motors are hot, ignoring wake-ups until released (thread-safe)."""
         self._command_queue.put(("thermal_hold", hold))
+
+    def set_antennas(self, antennas: Tuple[float, float], duration: float = ANTENNA_HOLD_BLEND_S) -> None:
+        """Ease the antennas to ``antennas`` (radians, left then right) and hold them there.
+
+        The hold outlives breathing and head or body moves; emotions and dances borrow the antennas and hand
+        them back; dozing drops the hold. Ignored while dozing. Thread-safe: posted to the worker command queue.
+        """
+        self._command_queue.put(("set_antennas", (float(antennas[0]), float(antennas[1]), float(duration))))
+
+    def release_antennas(self) -> None:
+        """Give the antennas back to breathing (thread-safe)."""
+        self._command_queue.put(("release_antennas", None))
 
     def set_speaking(self, speaking: bool) -> None:
         """Pause head tracking while the assistant speaks, resume it afterwards.
@@ -635,6 +653,20 @@ class MovementManager:
             self._set_dozing(self._thermal_hold or self._requested_dozing, current_time)
         elif command == "look_toward":
             self._look_toward(float(payload), current_time)
+        elif command == "set_antennas":
+            if self._dozing:
+                logger.info("Dozing; ignored set_antennas")
+                return
+            left, right, duration = payload
+            start = (float(self._last_commanded_pose[1][0]), float(self._last_commanded_pose[1][1]))
+            self._antenna_hold = (start, (left, right), current_time, max(0.0, duration))
+            self._antenna_hold_paused = False
+            self.state.update_activity()
+            logger.info("Holding the antennas at %.0f° / %.0f°", math.degrees(left), math.degrees(right))
+        elif command == "release_antennas":
+            if self._antenna_hold is not None:
+                self._antenna_hold = None
+                logger.info("Antennas released to breathing")
         elif command == "set_speaking":
             if not self._head_tracking or self._dozing:
                 return
@@ -1016,6 +1048,7 @@ class MovementManager:
         self._is_speaking = False
         self._reset_follow_state()
         if dozing:
+            self._antenna_hold = None  # sleep folds the antennas; they come back up with breathing on waking
             self.state.current_move = DozeMove(start_pose=head, start_antennas=antennas)
             self._breathing_active = False
             logger.info("Dozing: tucking the head and holding still")
@@ -1153,7 +1186,30 @@ class MovementManager:
             body_yaw += self._held_body_yaw
         else:
             body_yaw = self._held_body_yaw
+        antennas = self._held_antennas(antennas, move, current_time)
         return (head_pose, antennas, body_yaw)
+
+    def _held_antennas(
+        self, antennas: Tuple[float, float], move: Move | None, current_time: float
+    ) -> Tuple[float, float]:
+        """Antennas placed on request stay put; expressive moves use them and hand them back with a short blend."""
+        hold = self._antenna_hold
+        if hold is None:
+            return antennas
+        if isinstance(move, (DozeMove, LazyWakeMove, EmotionQueueMove, DanceQueueMove)):
+            self._antenna_hold_paused = True
+            return antennas
+        start, target, began, duration = hold
+        if self._antenna_hold_paused:
+            self._antenna_hold_paused = False
+            start, began = (
+                (float(self._last_commanded_pose[1][0]), float(self._last_commanded_pose[1][1])),
+                current_time,
+            )
+            self._antenna_hold = (start, target, began, duration)
+        s = 1.0 if duration <= 0 else min(1.0, max(0.0, (current_time - began) / duration))
+        s = s * s * (3 - 2 * s)  # ease in and out
+        return (start[0] + (target[0] - start[0]) * s, start[1] + (target[1] - start[1]) * s)
 
     def _update_primary_motion(self, current_time: float) -> None:
         """Advance queue state and idle behaviours for this tick."""
@@ -1383,6 +1439,7 @@ class MovementManager:
             "turning": self._turn_until is not None,
             "at_limit": self._limit_hold_until is not None,
             "antenna_blocked": [g.name for g in self._antenna_guards or () if g.blocked],
+            "antenna_hold": list(self._antenna_hold[1]) if self._antenna_hold is not None else None,
             "last_commanded_pose": {
                 "head": head_matrix,
                 "antennas": antennas,

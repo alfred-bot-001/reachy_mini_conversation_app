@@ -761,3 +761,79 @@ def test_no_recentring_while_a_face_is_in_view_or_something_is_playing() -> None
     manager.state.current_move = playing
     manager._watch_for_face(seen_at + RECENTER_QUIET_S + 1.0)
     assert manager.state.current_move is playing
+
+
+def _antenna_manager() -> MovementManager:
+    robot = MagicMock()
+    robot.get_current_joint_positions.return_value = ([0.0] * 7, [-0.1745, 0.1745])
+    manager = MovementManager(robot, antenna_guard=False)
+    return manager
+
+
+def test_antenna_hold_eases_in_and_outlives_breathing() -> None:
+    """set_antennas eases the antennas to the target and keeps them there while breathing wants them neutral."""
+    manager = _antenna_manager()
+    now = manager._now()
+    manager.state.current_move = BreathingMove(
+        create_head_pose(0, 0, 0, 0, 0, 0, degrees=True), (-0.1745, 0.1745), 0.1
+    )
+    manager.state.move_start_time = now
+    manager.set_antennas((-2.0, 2.0), duration=1.0)
+    manager._poll_signals(now)
+    assert manager.get_status()["antenna_hold"] == [-2.0, 2.0]
+
+    start = manager._get_primary_pose(now)[1]
+    assert start == pytest.approx((0.0, 0.0), abs=1e-6)  # starts from the last commanded antennas
+    half = manager._get_primary_pose(now + 0.5)[1]
+    assert -2.0 < half[0] < -0.5 and 0.5 < half[1] < 2.0
+    assert manager._get_primary_pose(now + 1.0)[1] == pytest.approx((-2.0, 2.0))
+    assert manager._get_primary_pose(now + 30.0)[1] == pytest.approx((-2.0, 2.0))  # breathing never takes them back
+
+    manager.release_antennas()
+    manager._poll_signals(now + 31.0)
+    assert manager.get_status()["antenna_hold"] is None
+    released = manager._get_primary_pose(now + 31.0)[1]
+    assert released != pytest.approx((-2.0, 2.0))
+
+
+def test_antenna_hold_yields_to_emotions_then_blends_back() -> None:
+    """An emotion clip uses the antennas; once it ends the held angle eases back in from where the clip left them."""
+    manager = _antenna_manager()
+    now = manager._now()
+    manager.set_antennas((-1.0, 1.0), duration=0.0)
+    manager._poll_signals(now)
+    assert manager._get_primary_pose(now)[1] == pytest.approx((-1.0, 1.0))
+
+    emotion = MagicMock(spec=EmotionQueueMove)
+    emotion.duration = 2.0
+    emotion.evaluate.return_value = (create_head_pose(0, 0, 0, 0, 0, 0, degrees=True), np.array([0.3, -0.3]), 0.0)
+    manager.state.current_move = emotion
+    manager.state.move_start_time = now
+    assert manager._get_primary_pose(now + 1.0)[1] == pytest.approx((0.3, -0.3))
+    manager._issue_control_command(create_head_pose(0, 0, 0, 0, 0, 0, degrees=True), (0.3, -0.3), 0.0)
+
+    manager.state.current_move = None
+    manager.state.move_start_time = None
+    manager._antenna_hold = (manager._antenna_hold[0], manager._antenna_hold[1], manager._antenna_hold[2], 1.0)
+    resumed = manager._get_primary_pose(now + 2.0)[1]
+    assert resumed == pytest.approx((0.3, -0.3), abs=1e-6)  # blend restarts from where the emotion left them
+    assert manager._get_primary_pose(now + 3.0)[1] == pytest.approx((-1.0, 1.0))
+
+
+def test_antenna_hold_is_dropped_by_dozing_and_refused_while_dozing() -> None:
+    """Sleep folds the antennas and forgets the hold; a request made while asleep is ignored, awake it works again."""
+    manager = _antenna_manager()
+    now = manager._now()
+    manager.set_antennas((-1.0, 1.0), duration=0.0)
+    manager._poll_signals(now)
+    manager.set_dozing(True)
+    manager._poll_signals(now + 0.1)
+    assert manager.get_status()["antenna_hold"] is None
+    manager.set_antennas((-1.0, 1.0), duration=0.0)
+    manager._poll_signals(now + 0.2)
+    assert manager.get_status()["antenna_hold"] is None  # asleep: ignored
+    manager.set_dozing(False)
+    manager._poll_signals(now + 0.3)
+    manager.set_antennas((-1.0, 1.0), duration=0.0)
+    manager._poll_signals(now + 0.4)
+    assert manager.get_status()["antenna_hold"] == [-1.0, 1.0]
