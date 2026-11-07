@@ -198,6 +198,8 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `camera` | Capture the latest camera frame and analyze it with the selected realtime backend. | Core install only. Requires the camera (disable with `--no-camera`). |
 | `idle_do_nothing` | Explicitly remain idle during an idle turn. Not intended for normal conversation turns. | Core install only. |
 | `move_head` | Queue a head pose change (left/right/up/down/front). | Core install only. |
+| `set_antennas` | Ease the antennas to an angle (0 = up, 165 = flat backwards) and hold them there through breathing and head moves. | Core install only. Held targets pass through the antenna stall guard; dozing releases them. |
+| `get_antennas` | Read the measured antenna angles, the held target and any stall the guard is yielding to. | Core install only. |
 | `head_tracking` | Follow the user's face with the head, or stop following. | Core install only. Requires a daemon with the `vision` extra and a camera. |
 | `go_to_sleep` | Run Reachy's sleep movement and stop the current app after an explicit user request. | Core install only. |
 | `sweep_look` | Sweep Reachy's head left, right, and back to center. | Shared tool, enabled by default in the default profile. |
