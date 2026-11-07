@@ -176,3 +176,13 @@ def test_a_failed_read_is_survived_and_retried(tmp_path: Path) -> None:
     monitor.poll_once()
     assert bus.reads == 1
     movement_manager.set_thermal_hold.assert_not_called()
+
+
+def test_motor_ids_match_the_sdk_hardware_config():
+    """The names must mean what the daemon means: it logs hardware errors under these names, by these IDs."""
+    import yaml
+    from importlib.resources import files
+
+    config = yaml.safe_load((files("reachy_mini") / "assets/config/hardware_config.yaml").read_text())
+    assert motor_health.MOTOR_IDS == {name: spec["id"] for motor in config["motors"] for name, spec in motor.items()}
+    assert motor_health.MOTOR_IDS["right_antenna"] == 17 and motor_health.MOTOR_IDS["left_antenna"] == 18
