@@ -15,6 +15,7 @@ import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.doze import DozeState, LoudnessTrigger, level_dbfs
 from reachy_mini_conversation_app.moves import (
     LAZY_WAKE_KEYFRAMES,
+    DOZE_ANTENNAS_JOINT_POSITIONS,
     DozeMove,
     LazyWakeMove,
     BreathingMove,
@@ -112,8 +113,12 @@ def test_doze_move_eases_into_sleep_pose_and_holds() -> None:
     held = [move.evaluate(t) for t in (3.0, 10.0, 600.0)]
     for head, antennas, body_yaw in held:
         np.testing.assert_allclose(head, SLEEP_HEAD_POSE, atol=1e-9)
-        np.testing.assert_allclose(antennas, SLEEP_ANTENNAS_JOINT_POSITIONS, atol=1e-9)
+        np.testing.assert_allclose(antennas, DOZE_ANTENNAS_JOINT_POSITIONS, atol=1e-9)
         assert body_yaw == 0.0
+    # The SDK sleep pose folds the antennas onto the mechanical stop, where the left one overloaded on 2026-11-05.
+    assert all(
+        abs(a) < abs(s) - np.radians(5) for a, s in zip(DOZE_ANTENNAS_JOINT_POSITIONS, SLEEP_ANTENNAS_JOINT_POSITIONS)
+    )
 
 
 def test_movement_manager_dozing_rejects_moves_and_wakes_to_breathing() -> None:

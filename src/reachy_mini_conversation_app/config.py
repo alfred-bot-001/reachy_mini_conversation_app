@@ -170,6 +170,12 @@ def resolve_daemon_doa_url() -> str:
 
 MOTOR_WATCHDOG_ENV = "REACHY_MINI_MOTOR_WATCHDOG"
 MOTOR_LOG_DIR_ENV = "REACHY_MINI_MOTOR_LOG_DIR"
+ANTENNA_GUARD_ENV = "REACHY_MINI_ANTENNA_GUARD"
+
+
+def antenna_guard_enabled() -> bool:
+    """Return whether a blocked antenna is yielded and retried instead of pushed until its motor overloads (default on)."""
+    return _env_flag(ANTENNA_GUARD_ENV, default=True)
 
 
 # Temperatures can only be read through the daemon's raw-packet websocket, which serves each packet with a blocking
